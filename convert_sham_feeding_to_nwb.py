@@ -1,7 +1,10 @@
 """
 One-time conversion of a Berke Lab sham-feeding session (.pkl) to NWB.
 
-The pickle is a 2-tuple of dicts, one per recording hemisphere (one optical fiber per hemisphere).
+The pickle is a 2-tuple of dicts, one per recording hemisphere ("side"). The two hemispheres are
+recorded simultaneously, each with its own optical fiber on its own serial port (COM3 / COM4), 
+so each hemisphere produces one data dict. All three analog channels within a dict come from that one hemisphere's fiber.
+
 Each dict's side/COM/region identity is read from its own 'Full_side_name' field (e.g. 'COM3_Left_mNacSh').
 The region<->side mapping differs between sessions (e.g. IM1923 has Left=mNacSh/Right=NacCore, 
 while IM1929 has Left=NacCore/Right=mNacSh).
@@ -219,6 +222,7 @@ def build_surgery(sides):
 def build_nwb(pkl_path: Path) -> NWBFile:
     with open(pkl_path, "rb") as pkl_file:
         sides_data = pickle.load(pkl_file)
+    # Two simultaneously-recorded hemispheres -> a 2-tuple of dicts (one dict per hemisphere/side).
     assert isinstance(sides_data, tuple) and len(sides_data) == 2, "Expected a 2-tuple (Left, Right)"
 
     # Use the first side for shared session-level metadata (subject info, grams consumed, etc)
@@ -320,11 +324,13 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                      "exc2 555-570, em2 580-680. FC connectors on all ports."))
     nwbfile.add_device(dichroic_mirror)
 
-    # One optical fiber per region, and two indicators (gACh4h, rDA3m) injected at each fiber site.
+    # One optical fiber per hemisphere, and two indicators (gACh4h, rDA3m) injected at each fiber site
     fibers_by_region = {}
     indicators_by_region_and_sensor = {}
     for side in sides:
+        # Region is "NacCore" or "mNacSh", hemisphere is "left" or "right"
         region, hemisphere = side["region"], side["hemisphere"]
+        # Get virus and fiber coords for this region
         coords = COORDS[region]
         ml_mm = -coords["ml"] if hemisphere == "left" else coords["ml"]
         fiber_coords = (coords["ap"], ml_mm, coords["dv_fiber"])  # AP, ML, DV (mm) of the fiber tip
@@ -361,7 +367,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     for side in sides:
         region = side["region"]
         for analog_key, wavelength, _hampel_key, indicator_key, _role in CHANNELS:
-            # The 405 reference channel belongs to gACh4h only (not rDA3m, which has no reference).
+            # The 405 reference channel belongs gACh4h (rDA3m has no reference wavelength)
             sensor = "gACh4h" if indicator_key == "reference" else indicator_key
             fiber_table.add_row(
                 location=region,
@@ -381,33 +387,40 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         return fiber_table.create_fiber_photometry_table_region(
             region=[row_index_by_channel[(region, analog_key)]], description=f"{analog_key} @ {region}")
 
-    # Per-side signals & tables
+    # Per-side signals & tables.
+    # Each iteration handles one recording hemisphere's dict (its own photometry + derived layers).
     side_metadata_rows = []
     for side in sides:
-        side_data = sides_data[side["index"]]
+        side_data = sides_data[side["index"]]   # the raw pickle dict for this hemisphere
         region = side["region"]
         n_samples = len(side_data["analog_1"])
 
-        # Offset of this side's photometry stream relative to session_start_time (seconds).
+        # Each dict carries two 86 Hz timebases that we align to the session start:
+        #   - the full photometry stream (length n_samples), beginning at stream_offset_s
+        #     (this side's box started a few ms after session_start_time);
+        #   - session-cropped arrays (length n_session_samples), cropped to the spout-access window,
+        #     beginning session_crop_start_s = stream start + SessionStart_frameNum samples.
         side_start_time = pd.Timestamp(side_data["date_time"]).to_pydatetime().replace(tzinfo=TZ)
         stream_offset_s = (side_start_time - session_start).total_seconds()
-        # Session-cropped arrays (len ~358273) begin at SessionStart_frameNum within the 86 Hz stream.
         session_crop_start_s = stream_offset_s + int(side_data["SessionStart_frameNum"]) / SAMPLING_RATE
 
-        # Photometry: raw, pyPhotometry-filtered, and hampel-cleaned -- all to acquisition.
+        # Add each raw, pyPhotometry-filtered, and hampel-cleaned series as a FiberPhotometryResponseSeries
         for analog_key, wavelength, hampel_key, _indicator_key, role in CHANNELS:
+            # Raw signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"raw_{wavelength}_{region}",
                 description=f"Raw {role} ({wavelength} nm) in {region}. pyPhotometry {side_data['mode']}.",
                 data=np.asarray(side_data[analog_key], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
                 fiber_photometry_table_region=channel_table_region(analog_key, region)))
+            # Filtered signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"filt_{wavelength}_{region}",
                 description=f"pyPhotometry-filtered {role} ({wavelength} nm) in {region}.",
                 data=np.asarray(side_data[f"{analog_key}_filt"], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
                 fiber_photometry_table_region=channel_table_region(analog_key, region)))
+            # Hampel-filtered signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"hampel_{wavelength}_{region}",
                 description=(f"Hampel-filtered {role} ({wavelength} nm) in {region} "
@@ -417,7 +430,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
                 fiber_photometry_table_region=channel_table_region(analog_key, region)))
 
-        # Digital sync + rsync pulse times
+        # Add digital sync + rsync pulse times
         nwbfile.add_acquisition(TimeSeries(
             name=f"digital_sync_{region}", description=f"Digital sync input (rsync) in {region}.",
             data=np.asarray(side_data["digital_1"], dtype="int8"), unit="n.a.",
@@ -479,7 +492,9 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             data=np.asarray(burst_vars["Labeled_BurstLick"], dtype="float64"), unit="n.a.",
             rate=SAMPLING_RATE, starting_time=session_crop_start_s))
 
-        # Derived lick event times (from cumulative-lick increments)
+        # Add derived lick event times (from cumulative-lick increments): 
+        # CumLicks is a running total, so a positive diff marks the sample(s) where new licks 
+        # were registered. Here we convert those sample indices to lick timestamps.
         lick_increments = np.diff(np.asarray(burst_vars["CumLicks"]))
         event_indices = np.where(lick_increments > 0)[0] + 1
         event_times = session_crop_start_s + event_indices / SAMPLING_RATE
@@ -508,7 +523,9 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 data=np.asarray(side_data[dlc_key], dtype="float64"), unit=unit,
                 rate=SAMPLING_RATE, starting_time=stream_offset_s))
 
-        # Per-lick table (one row per lick)
+        # Per-lick table (one row per lick). 
+        # There are n_licks durations but only n_licks-1 inter-lick intervals, 
+        # so the interval columns are NaN-padded out to n_licks.
         n_licks = burst_vars["NumLicks"]
         lick_table_df = pd.DataFrame({
             "lick_duration_ms": np.asarray(burst_vars["LickDurations_ms"], dtype="float64"),
