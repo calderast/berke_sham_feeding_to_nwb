@@ -1,17 +1,16 @@
 """
 One-time conversion of a Berke Lab sham-feeding session (.pkl) to NWB.
 
-The pickle is a 2-tuple of dicts, one per recording side / bottle. Each dict's
-side/COM/region identity is read from its own 'Full_side_name' field (e.g.
-'COM3_Left_mNacSh'), NOT assumed from tuple position -- the region<->side mapping
-differs between sessions (e.g. IM1923 has Left=mNacSh/Right=NacCore, while IM1929
-has them swapped, Left=NacCore/Right=mNacSh).
+The pickle is a 2-tuple of dicts, one per recording hemisphere (one optical fiber per hemisphere).
+Each dict's side/COM/region identity is read from its own 'Full_side_name' field (e.g. 'COM3_Left_mNacSh').
+The region<->side mapping differs between sessions (e.g. IM1923 has Left=mNacSh/Right=NacCore, 
+while IM1929 has Left=NacCore/Right=mNacSh).
 
 Each side holds pyPhotometry "3EX_2EM_pulsed" data at 86 Hz plus a large stack of
 derived behavioral layers (lick detection / bursts / rates, DLC head-to-spout
 distances, engagement states, approach/leave events, hampel QC, ...).
 
-Channel mapping:
+PyPhotometry channel mapping:
     analog_1 -> 470 nm -> gACh4h (green ACh sensor)        signal
     analog_2 -> 565 nm -> rDA3m  (red dopamine sensor)     signal
     analog_3 -> 405 nm -> gACh4h reference
@@ -75,7 +74,7 @@ EXPERIMENT_DESCRIPTION = (
 KEYWORDS = ["fiber photometry", "sham feeding", "sucrose", "licking",
             "nucleus accumbens", "dopamine", "acetylcholine", "rDA3m", "gACh4h"]
 
-# Virus description (same constructs for all animals)
+# Virus info (same constructs and coords for all animals)
 VIRUS = (
     "1:1 mix of two GRAB sensors, each injected undiluted from stock: "
     "AAV-hSyn-ACh4h3.8 (gACh4h acetylcholine sensor, 1.15e13 vg/mL, BrainVTA) and "
@@ -95,17 +94,18 @@ INDICATOR_INFO = {
                    manufacturer="BrainVTA"),
 }
 
-# Stereotaxic targets (male), mm from bregma. ML magnitude; sign is applied per hemisphere.
-# DV differs for the fiber tip (recording) vs the virus injection.
+# Stereotaxic coordinates (male rats only), in mm from bregma. 
+# ML coordinate here is magnitude only (sign is applied per hemisphere)
+# DV differs for the fiber tip (recording site) vs the virus injection site.
 COORDS = {
     "NacCore": dict(ap=1.7, ml=1.7, dv_fiber=6.8, dv_virus=7.0, angle_deg=0),
     "mNacSh":  dict(ap=1.3, ml=1.6, dv_fiber=6.2, dv_virus=6.4, angle_deg=6),
 }
 
-# Human-readable region names for the surgery description.
+# Readable region names for the surgery description
 REGION_DISPLAY = {"NacCore": "NAc core", "mNacSh": "medial NAc shell"}
 
-# Per analog channel: (pickle key, excitation wavelength nm, hampel-cleaned key, indicator key, role text).
+# per pyPhotometry channel: (pickle key, excitation wavelength nm, hampel-cleaned key, indicator key, description)
 CHANNELS = [
     ("analog_1", 470, "analog1_hampel", "gACh4h",    "gACh4h signal"),
     ("analog_2", 565, "analog2_hampel", "rDA3m",     "rDA3m signal"),
@@ -120,12 +120,16 @@ def sanitize(name: str) -> str:
     cleaned_chars = []
     for char in name:
         if char.isalnum():
+            # alphanumeric ok
             cleaned_chars.append(char)
         elif char == ".":
+            # periods aren't allowed in nwb names so use a "p" instead
             cleaned_chars.append("p")
         else:
+            # everything else (/, :, etc) gets replaced with an underscore
             cleaned_chars.append("_")
     cleaned_name = "".join(cleaned_chars)
+    # remove duplicate underscores
     while "__" in cleaned_name:
         cleaned_name = cleaned_name.replace("__", "_")
     return cleaned_name.strip("_")
@@ -163,7 +167,10 @@ def pad_to(array, length):
 
 
 def parse_side(index, side_data):
-    """Derive a side's identity from the pickle dict itself (no hard-coding).
+    """Derive a recording side's identity from the pickle dict.
+
+    Here 'side' is the recording hemisphere (one optical fiber per hemisphere) and
+    which port it was recorded from (COM3 or COM4).
 
     'Full_side_name' is formatted 'COM3_Left_mNacSh' / 'COM4_Right_NacCore'.
     Hit_*/Target_* and the COM ports are read from the matching L/R fields.
@@ -178,11 +185,10 @@ def parse_side(index, side_data):
 
 
 def build_surgery(sides):
-    """Build the surgery description from the regions actually targeted this session.
+    """Build the surgery description for the nwb based on the regions targeted this session.
 
-    Only the regions present in `sides` are described, with coordinates pulled from COORDS.
-    Handles bilateral targeting of the same region (e.g. bilateral NAc core) and reports
-    the ML sign(s) for the hemisphere(s) actually implanted.
+    Only the regions present in `sides` are described, with coordinates for core/shell pulled from COORDS.
+    Reports the ML sign(s) for the hemisphere(s) actually implanted (negative for left hemisphere).
     """
     hemispheres_by_region = {}  # region -> set of hemispheres, preserving first-seen order
     for side in sides:
@@ -215,18 +221,19 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         sides_data = pickle.load(pkl_file)
     assert isinstance(sides_data, tuple) and len(sides_data) == 2, "Expected a 2-tuple (Left, Right)"
 
-    first_side_data = sides_data[0]  # reference side for session-level metadata shared across sides
+    # Use the first side for shared session-level metadata (subject info, grams consumed, etc)
+    first_side_data = sides_data[0]
 
     # Session start = earliest side start (side 0). The other side is offset by a few ms.
     session_start = pd.Timestamp(first_side_data["date_time"]).to_pydatetime().replace(tzinfo=TZ)
 
-    # Read identity from the pickle rather than hard-coding it.
+    # Get sides from the pickle
     sides = [parse_side(index, side_data) for index, side_data in enumerate(sides_data)]
-    animal_name = str(first_side_data["subject_ID"]).split("_")[0]                # e.g. "IM1923"
-    trial_match = re.search(r"Trial[-_](.+?)_COM", str(first_side_data["filename"]))  # e.g. "SF5-Sucrose"
+    animal_name = str(first_side_data["subject_ID"]).split("_")[0]                      # e.g. "IM1923"
+    trial_match = re.search(r"Trial[-_](.+?)_COM", str(first_side_data["filename"]))    # e.g. "SF5-Sucrose"
     trial_label = trial_match.group(1) if trial_match else "session"
 
-    # Subject (from embedded animal metadata)
+    # Get subject info from pickle
     date_of_birth = pd.Timestamp(first_side_data["DOB"]).to_pydatetime().replace(tzinfo=TZ)
     subject = Subject(
         subject_id=animal_name,
@@ -241,11 +248,11 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     )
 
     session_id = f"{animal_name}_{trial_label}_{session_start.strftime('%Y%m%d')}"
-    bottle_descriptions = "; ".join(
-        f"{side['side']} bottle {side['com']} -> {side['region']} (target {side['target']})"
+    hemisphere_descriptions = "; ".join(
+        f"{side['side']} hemisphere ({side['com']}) recorded from {side['region']} (target {side['target']})"
         for side in sides)
     notes = (
-        f"Sham-feeding {trial_label} trial. {bottle_descriptions}. "
+        f"Sham-feeding {trial_label} trial. {hemisphere_descriptions}. "
         f"Grams consumed: {first_side_data['GramConsumed']:.2f} g; "
         f"grams in pan: {first_side_data['GramInPan']:.2f} g. "
         f"pyPhotometry mode '{first_side_data['mode']}', sampling rate {first_side_data['sampling_rate']} Hz, "
