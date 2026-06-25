@@ -22,6 +22,7 @@ Style follows https://github.com/calderast/jdb_to_nwb (convert_photometry.py).
 """
 
 import re
+import sys
 import uuid
 import json
 import pickle
@@ -388,14 +389,17 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         side_desc = f"{side['hemisphere']} {region}"     # e.g. "left mNacSh", for descriptions
         n_samples = len(side_data["analog_1"])
 
-        # Each dict carries two 86 Hz timebases that we align to the session start:
-        #   - the full photometry stream (length n_samples), beginning at stream_offset_s
-        #     (this side's box started a few ms after session_start_time);
-        #   - session-cropped arrays (length n_session_samples), cropped to the spout-access window,
-        #     beginning session_crop_start_s = stream start + SessionStart_frameNum samples.
-        side_start_time = pd.Timestamp(side_data["date_time"]).to_pydatetime().replace(tzinfo=TZ)
-        stream_offset_s = (side_start_time - session_start).total_seconds()
-        session_crop_start_s = stream_offset_s + int(side_data["SessionStart_frameNum"]) / SAMPLING_RATE
+        # NWB stores each regularly-sampled series as (starting_time, rate); sample i is at
+        # starting_time + i / SAMPLING_RATE. Each dict has two 86 Hz timebases:
+        #   - the full photometry stream (length n_samples) starts at session_start (starting_time=0);
+        #   - the session-cropped arrays (length n_session_samples) trim that stream to the actual session
+        #     window, so they start at sample SessionStart_frameNum (e.g. ~2451 -> ~28.5 s in).
+        #
+        # We anchor BOTH sides at session_start=0 (the shared rsync pulses show the two sides begin within
+        # ~1 sample of each other). Within a side every stream shares one clock, so 86 Hz placement is
+        # exact. Across sides the clocks drift ~50 ms over a session, left for downstream correction
+        # using the rsync_pulse_times_* series stored in acquisition.
+        session_crop_start_s = int(side_data["SessionStart_frameNum"]) / SAMPLING_RATE
 
         # Add each raw, pyPhotometry-filtered, and hampel-cleaned series as a FiberPhotometryResponseSeries
         for analog_key, wavelength, hampel_key, _sensor, role in CHANNELS:
@@ -404,14 +408,14 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 name=f"raw_{wavelength}_{side_label}",
                 description=f"Raw {role} ({wavelength} nm) in {side_desc}. pyPhotometry {side_data['mode']}.",
                 data=np.asarray(side_data[analog_key], dtype="float64"),
-                unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
+                unit="V", rate=SAMPLING_RATE, starting_time=0.0,
                 fiber_photometry_table_region=channel_table_region(analog_key, side_label)))
             # Filtered signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"filt_{wavelength}_{side_label}",
                 description=f"pyPhotometry-filtered {role} ({wavelength} nm) in {side_desc}.",
                 data=np.asarray(side_data[f"{analog_key}_filt"], dtype="float64"),
-                unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
+                unit="V", rate=SAMPLING_RATE, starting_time=0.0,
                 fiber_photometry_table_region=channel_table_region(analog_key, side_label)))
             # Hampel-filtered signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
@@ -420,19 +424,19 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                             f"(window {side_data['QC']['hampel']['window_sec']}s, "
                             f"{side_data['QC']['hampel']['n_sigmas']} sigma)."),
                 data=np.asarray(side_data[hampel_key], dtype="float64"),
-                unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
+                unit="V", rate=SAMPLING_RATE, starting_time=0.0,
                 fiber_photometry_table_region=channel_table_region(analog_key, side_label)))
 
         # Add digital sync + rsync pulse times
         nwbfile.add_acquisition(TimeSeries(
             name=f"digital_sync_{side_label}", description=f"Digital sync input (rsync) in {side_desc}.",
             data=np.asarray(side_data["digital_1"], dtype="int8"), unit="n.a.",
-            rate=SAMPLING_RATE, starting_time=stream_offset_s))
+            rate=SAMPLING_RATE, starting_time=0.0))
         nwbfile.add_acquisition(TimeSeries(
             name=f"rsync_pulse_times_{side_label}",
             description=f"Times of rsync rising edges in {side_desc} (from pyPhotometry pulse_times_1).",
             data=np.ones(len(side_data["pulse_times_1"]), dtype="int8"), unit="n.a.",
-            timestamps=np.asarray(side_data["pulse_times_1"], dtype="float64") / 1000.0 + stream_offset_s))
+            timestamps=np.asarray(side_data["pulse_times_1"], dtype="float64") / 1000.0))
 
         # Per-sample behavior series at the full 86 Hz photometry clock (length n_samples).
         per_sample_series = {
@@ -449,7 +453,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             behavior_module.add(TimeSeries(
                 name=series_name, description=description,
                 data=np.asarray(side_data[pickle_key], dtype="float64"),
-                unit=unit, rate=SAMPLING_RATE, starting_time=stream_offset_s))
+                unit=unit, rate=SAMPLING_RATE, starting_time=0.0))
 
         # Engagement state vectors (auto + manual thresholds)
         for engagement_key in [key for key in side_data if key.startswith("Engagement")]:
@@ -458,7 +462,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 description=(f"Engagement state ('{engagement_key}'): "
                             f"animal engaged with spout (1) or not (0), in {side_desc}."),
                 data=np.asarray(side_data[engagement_key], dtype="int8"), unit="n.a.",
-                rate=SAMPLING_RATE, starting_time=stream_offset_s))
+                rate=SAMPLING_RATE, starting_time=0.0))
 
         # Session-cropped series (length n_session_samples), starting at the SessionStart frame.
         cleaned_head_distance = side_data["Cleaned_Head_Distance"]
@@ -514,7 +518,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 name=sanitize(f"{dlc_key}_{side_label}"),
                 description=f"DeepLabCut '{dlc_key}' in {side_desc}.",
                 data=np.asarray(side_data[dlc_key], dtype="float64"), unit=unit,
-                rate=SAMPLING_RATE, starting_time=stream_offset_s))
+                rate=SAMPLING_RATE, starting_time=0.0))
 
         # Per-lick table (one row per lick). 
         # There are n_licks durations but only n_licks-1 inter-lick intervals, 
@@ -579,7 +583,6 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             "session_end_frame": int(side_data["SessionEnd_frameNum"]),
             "bottle_in_frame": int(side_data["BottleIn_frameNum"]),
             "n_photometry_samples": int(n_samples), "n_session_samples": int(n_session_samples),
-            "stream_start_offset_s": float(stream_offset_s),
             "lick_detection_config_json": json_str(side_data["Processing_params"]["Config_Lickdetection"]),
             "hampel_qc_json": json_str(side_data["QC"]["hampel"]),
             "distance_states_qc_json": json_str(side_data["QC"]["distance_states_transition_events"]),
@@ -610,7 +613,6 @@ def convert_one(pkl_path: Path):
 
 
 def main():
-    import sys
     # Convert the pickle(s) given on the command line, or every *_lickprocessed.pkl
     # in this directory if none are given.
     given_paths = [Path(p) for p in sys.argv[1:]]
