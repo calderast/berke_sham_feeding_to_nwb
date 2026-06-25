@@ -99,7 +99,7 @@ INDICATOR_INFO = {
 
 # Stereotaxic coordinates (male rats only), in mm from bregma. 
 # ML coordinate here is magnitude only (sign is applied per hemisphere)
-# DV differs for the fiber tip (recording site) vs the virus injection site.
+# DV is .2mm higher for the fiber tip (recording site) vs the virus injection site
 COORDS = {
     "NacCore": dict(ap=1.7, ml=1.7, dv_fiber=6.8, dv_virus=7.0, angle_deg=0),
     "mNacSh":  dict(ap=1.3, ml=1.6, dv_fiber=6.2, dv_virus=6.4, angle_deg=6),
@@ -108,11 +108,11 @@ COORDS = {
 # Readable region names for the surgery description
 REGION_DISPLAY = {"NacCore": "NAc core", "mNacSh": "medial NAc shell"}
 
-# per pyPhotometry channel: (pickle key, excitation wavelength nm, hampel-cleaned key, indicator key, description)
+# per pyPhotometry channel: (pickle key, excitation wavelength nm, hampel-cleaned key, sensor, description)
 CHANNELS = [
-    ("analog_1", 470, "analog1_hampel", "gACh4h",    "gACh4h signal"),
-    ("analog_2", 565, "analog2_hampel", "rDA3m",     "rDA3m signal"),
-    ("analog_3", 405, "analog3_hampel", "reference", "gACh4h reference"),
+    ("analog_1", 470, "analog1_hampel", "gACh4h", "gACh4h signal"),
+    ("analog_2", 565, "analog2_hampel", "rDA3m",  "rDA3m signal"),
+    ("analog_3", 405, "analog3_hampel", "gACh4h", "gACh4h reference (ratiometric)"),
 ]
 
 
@@ -120,22 +120,9 @@ CHANNELS = [
 
 def sanitize(name: str) -> str:
     """Make a string safe/readable for an NWB object name."""
-    cleaned_chars = []
-    for char in name:
-        if char.isalnum():
-            # alphanumeric ok
-            cleaned_chars.append(char)
-        elif char == ".":
-            # periods aren't allowed in nwb names so use a "p" instead
-            cleaned_chars.append("p")
-        else:
-            # everything else (/, :, etc) gets replaced with an underscore
-            cleaned_chars.append("_")
-    cleaned_name = "".join(cleaned_chars)
-    # remove duplicate underscores
-    while "__" in cleaned_name:
-        cleaned_name = cleaned_name.replace("__", "_")
-    return cleaned_name.strip("_")
+    name = name.replace(".", "p") # "." isn't allowed in nwb names so use a "p" instead (e.g. "274.64" -> "274p64")
+    name = re.sub(r"[^0-9A-Za-z]+", "_", name) # collapse any other run of illegal chars (/, :, -, space) to one "_"
+    return name.strip("_")
 
 
 def to_epoch_seconds(datetime_series: pd.Series) -> np.ndarray:
@@ -181,7 +168,7 @@ def parse_side(index, side_data):
     # Parse Full_side_name to get port (COM3 or COM4), hemisphere (left or right), and brain region
     name_parts = str(side_data["Full_side_name"]).split("_")
     com_port, side_name, region = name_parts[0], name_parts[1], "_".join(name_parts[2:])
-    hemisphere = "left" if side_name.lower().startswith("l") else "right"
+    hemisphere = side_name.lower()  # "Left" -> "left", "Right" -> "right"
     # Get region targeted (based on coords) and actually hit (verified via histology) for this hemisphere
     target = side_data["Target_L"] if side_name == "Left" else side_data["Target_R"]
     hit = side_data["Hit_L"] if side_name == "Left" else side_data["Hit_R"]
@@ -197,7 +184,7 @@ def build_surgery(sides):
     Only the regions present in `sides` are described, with coordinates for core/shell pulled from COORDS.
     Reports the ML sign(s) for the hemisphere(s) actually implanted (negative for left hemisphere).
     """
-    hemispheres_by_region = {}  # region -> set of hemispheres, preserving first-seen order
+    hemispheres_by_region = {}  # region -> set of hemispheres
     for side in sides:
         hemispheres_by_region.setdefault(side["region"], set()).add(side["hemisphere"])
 
@@ -341,6 +328,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         fiber_coords = (coords["ap"], ml_mm, coords["dv_fiber"])  # AP, ML, DV (mm) of the fiber tip
         virus_coords = (coords["ap"], ml_mm, coords["dv_virus"])  # AP, ML, DV (mm) of the virus injection
         side["fiber_coords"] = fiber_coords
+        side["virus_coords"] = virus_coords
 
         angle_label = "no angle" if coords["angle_deg"] == 0 else f"{coords['angle_deg']} degree angle"
         fiber = OpticalFiber(
@@ -371,9 +359,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     next_row_index = 0
     for side in sides:
         region, side_label = side["region"], side["label"]
-        for analog_key, wavelength, _hampel_key, indicator_key, _role in CHANNELS:
-            # The 405 reference channel belongs gACh4h (rDA3m has no reference wavelength)
-            sensor = "gACh4h" if indicator_key == "reference" else indicator_key
+        for analog_key, wavelength, _hampel_key, sensor, _role in CHANNELS:
             fiber_table.add_row(
                 location=region,
                 coordinates=side["fiber_coords"],  # AP, ML, DV (mm) of the recording fiber tip
@@ -412,7 +398,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         session_crop_start_s = stream_offset_s + int(side_data["SessionStart_frameNum"]) / SAMPLING_RATE
 
         # Add each raw, pyPhotometry-filtered, and hampel-cleaned series as a FiberPhotometryResponseSeries
-        for analog_key, wavelength, hampel_key, _indicator_key, role in CHANNELS:
+        for analog_key, wavelength, hampel_key, _sensor, role in CHANNELS:
             # Raw signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"raw_{wavelength}_{side_label}",
@@ -580,8 +566,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             "full_side_name": side_data["Full_side_name"],
             "indicator_470nm": "gACh4h", "indicator_565nm": "rDA3m", "reference_405nm": "gACh4h reference",
             "fiber_coords_ap_ml_dv_mm_json": json_str(list(side["fiber_coords"])),
-            "virus_coords_ap_ml_dv_mm_json": json_str([COORDS[region]["ap"],
-                                                       side["fiber_coords"][1], COORDS[region]["dv_virus"]]),
+            "virus_coords_ap_ml_dv_mm_json": json_str(list(side["virus_coords"])),
             "implant_angle_deg": int(COORDS[region]["angle_deg"]),
             "ppd_filename": side_data["filename"],
             "mode": side_data["mode"], "sampling_rate_hz": float(side_data["sampling_rate"]),
