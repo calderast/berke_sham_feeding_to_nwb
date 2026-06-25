@@ -1,0 +1,20 @@
+# Clean env for the Berke sham-feeding -> NWB conversion + verification notebook.
+# Tested on Python 3.12 with the versions pinned below.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#   python convert_sham_feeding_to_nwb.py      # writes the .nwb
+#   jupyter lab verify_nwb.ipynb               # run the verification plots
+
+# --- core NWB stack (convert_sham_feeding_to_nwb.py) ---
+pynwb==3.0.0                 # pulls in hdmf + h5py + numpy
+hdmf==4.1.0
+ndx-fiber-photometry==0.1.0  # FiberPhotometryResponseSeries, Indicator, ExcitationSource, ...
+numpy==2.2.6
+pandas==2.3.3
+
+# --- plotting + notebook (verify_nwb.ipynb) ---
+matplotlib==3.10.7
+jupyterlab==4.*
+ipykernel==7.1.0
+nbconvert==7.*               # lets you run the notebook headless if desired
