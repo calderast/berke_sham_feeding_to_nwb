@@ -1,9 +1,11 @@
 """
 One-time conversion of a Berke Lab sham-feeding session (.pkl) to NWB.
 
-The pickle is a 2-tuple of dicts, one per recording side / bottle:
-    element 0 -> Left  / COM3 / mNacSh
-    element 1 -> Right / COM4 / NacCore
+The pickle is a 2-tuple of dicts, one per recording side / bottle. Each dict's
+side/COM/region identity is read from its own 'Full_side_name' field (e.g.
+'COM3_Left_mNacSh'), NOT assumed from tuple position -- the region<->side mapping
+differs between sessions (e.g. IM1923 has Left=mNacSh/Right=NacCore, while IM1929
+has them swapped, Left=NacCore/Right=mNacSh).
 
 Each side holds pyPhotometry "3EX_2EM_pulsed" data at 86 Hz plus a large stack of
 derived behavioral layers (lick detection / bursts / rates, DLC head-to-spout
@@ -12,13 +14,14 @@ distances, engagement states, approach/leave events, hampel QC, ...).
 Channel mapping (provided by S. Crater, matches the 3-signal pyPhotometry case in jdb_to_nwb):
     analog_1 -> 470 nm -> gACh4h (green ACh sensor)        signal
     analog_2 -> 565 nm -> rDA3m  (red dopamine sensor)     signal
-    analog_3 -> 405 nm -> isosbestic reference (shared)
+    analog_3 -> 405 nm -> gACh4h reference
 
 Style follows https://github.com/calderast/jdb_to_nwb (convert_photometry.py).
 """
 
 import json
 import pickle
+import re
 import uuid
 from pathlib import Path
 from datetime import datetime
@@ -55,8 +58,8 @@ EXPERIMENTER = ["Slomp, Margo"]
 
 EXPERIMENT_DESCRIPTION = (
     "Sham-feeding sucrose task with dual-region nucleus accumbens fiber photometry. "
-    "Two fibers record the green acetylcholine sensor gACh4h (470 nm) and the red "
-    "dopamine sensor rDA3m (565 nm) against a 405 nm isosbestic reference, one in medial "
+    "Two fibers record the green acetylcholine sensor gACh4h (470 nm, with its own 405 nm "
+    "reference channel) and the red dopamine sensor rDA3m (565 nm, no reference channel), one in medial "
     "NAc shell (mNacSh, left) and one in NAc core (NacCore, right), while licking at a "
     "sucrose spout is detected and the animal's head/nose distance to the spout is tracked."
 )
@@ -67,7 +70,7 @@ KEYWORDS = ["fiber photometry", "sham feeding", "sucrose", "licking",
 CHANNELS = [
     ("analog_1", 470, "analog1_hampel", "gACh4h",    "gACh4h signal"),
     ("analog_2", 565, "analog2_hampel", "rDA3m",     "rDA3m signal"),
-    ("analog_3", 405, "analog3_hampel", "reference", "isosbestic reference"),
+    ("analog_3", 405, "analog3_hampel", "reference", "gACh4h reference"),
 ]
 
 INDICATOR_INFO = {
@@ -79,11 +82,6 @@ INDICATOR_INFO = {
                    manufacturer="BrainVTA"),
 }
 
-# Per-side description. idx -> metadata used to disambiguate device/series names.
-SIDES = [
-    dict(idx=0, side="Left",  com="COM3", region="mNacSh",  hemisphere="left"),
-    dict(idx=1, side="Right", com="COM4", region="NacCore", hemisphere="right"),
-]
 
 
 # ----------------------------------------------------------------------------
@@ -136,6 +134,21 @@ def pad_to(arr, length):
     return np.concatenate([arr, np.full(length - len(arr), np.nan)])
 
 
+def parse_side(idx, e):
+    """Derive a side's identity from the pickle dict itself (no hard-coding).
+
+    'Full_side_name' is formatted 'COM3_Left_mNacSh' / 'COM4_Right_NacCore'.
+    Hit_*/Target_* and the COM ports are read from the matching L/R fields.
+    """
+    parts = str(e["Full_side_name"]).split("_")
+    com, side, region = parts[0], parts[1], "_".join(parts[2:])
+    hemisphere = "left" if side.lower().startswith("l") else "right"
+    hit = e["Hit_L"] if side == "Left" else e["Hit_R"]
+    target = e["Target_L"] if side == "Left" else e["Target_R"]
+    return dict(idx=idx, side=side, com=com, region=region,
+                hemisphere=hemisphere, hit=hit, target=target)
+
+
 # ----------------------------------------------------------------------------
 # Build the NWB file
 # ----------------------------------------------------------------------------
@@ -149,32 +162,38 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     # Session start = earliest side start (side 0). Side 1 is offset by a few ms.
     session_start = pd.Timestamp(e0["date_time"]).to_pydatetime().replace(tzinfo=TZ)
 
+    # Read identity from the pickle rather than hard-coding it.
+    sides = [parse_side(i, d) for i, d in enumerate(data)]
+    animal_name = str(e0["subject_ID"]).split("_")[0]                  # e.g. "IM1923"
+    mt = re.search(r"Trial[-_](.+?)_COM", str(e0["filename"]))          # e.g. "SF5-Sucrose"
+    trial_label = mt.group(1) if mt else "session"
+
     # ---- Subject (from embedded animal metadata) ----
     dob = pd.Timestamp(e0["DOB"]).to_pydatetime().replace(tzinfo=TZ)
     subject = Subject(
-        subject_id="IM1923",
+        subject_id=animal_name,
         species=SPECIES,
         sex={"Male": "M", "Female": "F"}.get(e0["Sex"], "U"),
-        genotype="WT",
+        genotype=str(e0["Strain"]),
         strain=str(e0["Strain"]),
         date_of_birth=dob,
         description=(f"Full animal number {e0['Full_animalNumber']}. "
                      f"Strain {e0['Strain']}. pyPhotometry subject_ID '{e0['subject_ID']}'."),
     )
 
-    session_id = f"IM1923_SF5-Sucrose_{session_start.strftime('%Y%m%d')}"
+    session_id = f"{animal_name}_{trial_label}_{session_start.strftime('%Y%m%d')}"
+    side_desc = "; ".join(
+        f"{sd['side']} bottle {sd['com']} -> {sd['region']} (target {sd['target']})" for sd in sides)
     notes = (
-        f"Sham-feeding sucrose trial SF5. "
-        f"Left bottle {e0['Left_COM']} -> {e0['Hit_L']} (target {e0['Target_L']}); "
-        f"Right bottle {e0['Right_COM']} -> {data[1]['Hit_R']} (target {data[1]['Target_R']}). "
+        f"Sham-feeding {trial_label} trial. {side_desc}. "
         f"Grams consumed: {e0['GramConsumed']:.2f} g; grams in pan: {e0['GramInPan']:.2f} g. "
         f"pyPhotometry mode '{e0['mode']}', sampling rate {e0['sampling_rate']} Hz, "
         f"LED current {e0['LED_current']} mA, volts/division {e0['volts_per_division']}."
     )
 
     nwbfile = NWBFile(
-        session_description=("Sham-feeding sucrose task (trial SF5) with dual-region NAc fiber "
-                             "photometry (gACh4h 470 nm, rDA3m 565 nm, 405 nm isosbestic) and lick detection."),
+        session_description=(f"Sham-feeding {trial_label} task with dual-region NAc fiber "
+                             "photometry (gACh4h 470 nm, rDA3m 565 nm, 405 nm gACh4h reference) and lick detection."),
         identifier=str(uuid.uuid4()),
         session_start_time=session_start,
         timestamps_reference_time=session_start,
@@ -191,8 +210,6 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     )
 
     # ---- Processing modules ----
-    ophys_mod = nwbfile.create_processing_module(
-        "ophys", "Filtered and hampel-cleaned photometry signals, plus digital sync.")
     behavior_mod = nwbfile.create_processing_module(
         "behavior", "Lick detection, bottle position, engagement, approach/leave states, lick rates.")
     dlc_mod = nwbfile.create_processing_module(
@@ -224,7 +241,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     nwbfile.add_device(dichroic)
 
     fibers, indicators = {}, {}
-    for s in SIDES:
+    for s in sides:
         fiber = OpticalFiber(
             name=f"Doric 0.66mm Flat 40mm Optic Fiber ({s['hemisphere']} {s['region']})",
             manufacturer="Doric", model="MFC_200/250-0.66_40mm_MF2.5_FLT",
@@ -246,10 +263,10 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                                     description="Fiber, indicator and excitation source for each recorded channel.")
     row_index = {}  # (region, analog_key) -> row idx
     next_row = 0
-    for s in SIDES:
+    for s in sides:
         region = s["region"]
         for akey, wl, _hk, ind_key, _role in CHANNELS:
-            # The 405 isosbestic reference belongs to the gACh4h sensor row-wise.
+            # The 405 reference channel belongs to gACh4h only (not rDA3m, which has no reference).
             indicator_obj = indicators[(region, "gACh4h" if ind_key == "reference" else ind_key)]
             fp_table.add_row(
                 location=region,
@@ -269,7 +286,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
 
     # ---- Per-side signals & tables ----
     side_meta_rows = []
-    for s in SIDES:
+    for s in sides:
         e = data[s["idx"]]
         region = s["region"]
         n = len(e["analog_1"])
@@ -288,13 +305,13 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 data=np.asarray(e[akey], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=offset,
                 fiber_photometry_table_region=reg))
-            ophys_mod.add(FiberPhotometryResponseSeries(
+            nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"filt_{wl}_{region}",
                 description=f"pyPhotometry-filtered {role} ({wl} nm) in {region}.",
                 data=np.asarray(e[f"{akey}_filt"], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=offset,
                 fiber_photometry_table_region=region_of(akey, region)))
-            ophys_mod.add(FiberPhotometryResponseSeries(
+            nwbfile.add_acquisition(FiberPhotometryResponseSeries(
                 name=f"hampel_{wl}_{region}",
                 description=(f"Hampel-filtered {role} ({wl} nm) in {region} "
                             f"(window {e['QC']['hampel']['window_sec']}s, {e['QC']['hampel']['n_sigmas']} sigma)."),
@@ -303,11 +320,11 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 fiber_photometry_table_region=region_of(akey, region)))
 
         # ----- Digital sync + rsync pulse times -----
-        ophys_mod.add(TimeSeries(
+        nwbfile.add_acquisition(TimeSeries(
             name=f"digital_sync_{region}", description=f"Digital sync input (rsync) in {region}.",
             data=np.asarray(e["digital_1"], dtype="int8"), unit="n.a.",
             rate=SAMPLING_RATE, starting_time=offset))
-        ophys_mod.add(TimeSeries(
+        nwbfile.add_acquisition(TimeSeries(
             name=f"rsync_pulse_times_{region}",
             description=f"Times of rsync rising edges in {region} (from pyPhotometry pulse_times_1).",
             data=np.ones(len(e["pulse_times_1"]), dtype="int8"), unit="n.a.",
@@ -431,10 +448,9 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         # ----- Side metadata row -----
         side_meta_rows.append({
             "side": s["side"], "com_port": s["com"], "region": region,
-            "hit": e["Hit_L"] if s["idx"] == 0 else e["Hit_R"],
-            "target": e["Target_L"] if s["idx"] == 0 else e["Target_R"],
+            "hit": s["hit"], "target": s["target"],
             "full_side_name": e["Full_side_name"],
-            "indicator_470nm": "gACh4h", "indicator_565nm": "rDA3m", "reference_405nm": "isosbestic",
+            "indicator_470nm": "gACh4h", "indicator_565nm": "rDA3m", "reference_405nm": "gACh4h reference",
             "ppd_filename": e["filename"],
             "mode": e["mode"], "sampling_rate_hz": float(e["sampling_rate"]),
             "led_current_mA_json": json_str(e["LED_current"]),
@@ -459,24 +475,34 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     return nwbfile
 
 
-def main():
-    pkl_path = Path("IM1923_Trial-SF5-Sucrose_11-06-2025_lickprocessed.pkl")
-    out_path = Path(f"IM1923_SF5-Sucrose_20251106.nwb")
+def convert_one(pkl_path: Path):
     print(f"Reading {pkl_path} ...")
     nwbfile = build_nwb(pkl_path)
+    out_path = pkl_path.parent / f"{nwbfile.session_id}.nwb"  # data-driven name from session_id
     print(f"Writing {out_path} ...")
     with NWBHDF5IO(out_path, mode="w") as io:
         io.write(nwbfile)
-    print("Done.")
 
     # Read back as a sanity check
     with NWBHDF5IO(out_path, mode="r") as io:
         nwb = io.read()
-        print("Re-read OK:", nwb.session_id)
-        print("  acquisition:", len(nwb.acquisition), "objects")
-        print("  ophys:", len(nwb.processing["ophys"].data_interfaces))
-        print("  behavior:", len(nwb.processing["behavior"].data_interfaces))
-        print("  dlc:", len(nwb.processing["dlc"].data_interfaces))
+        print(f"Done. Re-read OK: {nwb.session_id} | "
+              f"acquisition: {len(nwb.acquisition)}, "
+              f"behavior: {len(nwb.processing['behavior'].data_interfaces)}, "
+              f"dlc: {len(nwb.processing['dlc'].data_interfaces)}")
+
+
+def main():
+    import sys
+    # Convert the pickle(s) given on the command line, or every *_lickprocessed.pkl
+    # in this directory if none are given.
+    args = [Path(p) for p in sys.argv[1:]]
+    pkl_paths = args or sorted(Path(__file__).parent.glob("*_lickprocessed.pkl"))
+    if not pkl_paths:
+        print("No pickle files given and no *_lickprocessed.pkl found in this directory.")
+        return
+    for pkl_path in pkl_paths:
+        convert_one(pkl_path)
 
 
 if __name__ == "__main__":
