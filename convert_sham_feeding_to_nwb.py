@@ -11,7 +11,7 @@ Each side holds pyPhotometry "3EX_2EM_pulsed" data at 86 Hz plus a large stack o
 derived behavioral layers (lick detection / bursts / rates, DLC head-to-spout
 distances, engagement states, approach/leave events, hampel QC, ...).
 
-Channel mapping (provided by S. Crater, matches the 3-signal pyPhotometry case in jdb_to_nwb):
+Channel mapping:
     analog_1 -> 470 nm -> gACh4h (green ACh sensor)        signal
     analog_2 -> 565 nm -> rDA3m  (red dopamine sensor)     signal
     analog_3 -> 405 nm -> gACh4h reference
@@ -45,11 +45,11 @@ from ndx_fiber_photometry import (
     FiberPhotometry,
 )
 
-# ----------------------------------------------------------------------------
-# Constants / session-level assumptions  (VERIFY the flagged ones before sharing)
-# ----------------------------------------------------------------------------
+
+## Constants
+
 TZ = ZoneInfo("America/Los_Angeles")
-SAMPLING_RATE = 86.0  # Hz, pyPhotometry per-channel rate (from pickle 'sampling_rate')
+SAMPLING_RATE = 86.0  # Hz, pyPhotometry per-channel rate
 
 SPECIES = "Rattus norvegicus"
 INSTITUTION = "University of California, San Francisco"
@@ -58,10 +58,11 @@ EXPERIMENTER = ["Slomp, Margo"]
 
 EXPERIMENT_DESCRIPTION = (
     "Sham-feeding sucrose task with dual-region nucleus accumbens fiber photometry. "
-    "Two fibers record the green acetylcholine sensor gACh4h (470 nm, with its own 405 nm "
-    "reference channel) and the red dopamine sensor rDA3m (565 nm, no reference channel), one in "
-    "NAc core (NacCore) and one in medial NAc shell (mNacSh), while licking at a sucrose spout is "
-    "detected and the animal's head/nose distance to the spout is tracked. "
+    "Two fibers record the green acetylcholine sensor gACh4h (470 nm, with 405 nm "
+    "reference channel) and the red dopamine sensor rDA3m (565 nm, no reference channel) from two "
+    "nucleus accumbens sites (core and/or medial shell; see the 'surgery' field for this session's "
+    "targets), while licking at a sucrose spout is detected and the animal's head/nose distance to "
+    "the spout is tracked. "
     "Task structure: 10 min baseline (no bottle available), then 60 x 30 s spout-access periods each "
     "followed by 30 s of no access; a 350 ms 4000 Hz tone marks each trial start. The animal is sham-fed "
     "0.8 M sucrose (sham feeding is considered successful when liquid collected in the pan is >= 50% of "
@@ -70,28 +71,16 @@ EXPERIMENT_DESCRIPTION = (
     "detection and moving spout), and Python with custom scripts. Animals were flushed with heated "
     "(~body temp) 0.9% NaCl."
 )
+
 KEYWORDS = ["fiber photometry", "sham feeding", "sucrose", "licking",
             "nucleus accumbens", "dopamine", "acetylcholine", "rDA3m", "gACh4h"]
 
-# Virus / surgery descriptions (same construct + targets for both animals; coordinates are for males).
+# Virus description (same constructs for all animals)
 VIRUS = (
     "1:1 mix of two GRAB sensors, each injected undiluted from stock: "
     "AAV-hSyn-ACh4h3.8 (gACh4h acetylcholine sensor, 1.15e13 vg/mL, BrainVTA) and "
     "AAV9-hSyn-rDA3m (red-shifted dopamine sensor, 5.89e12 vg/mL, BrainVTA)."
 )
-SURGERY = (
-    "Bilateral NAc fiber photometry. Target coordinates (male, mm from bregma; ML +/- for right/left): "
-    "NAc core AP +1.7, ML +/-1.7, DV 6.8 from dura (fiber) / 7.0 (virus), no angle; "
-    "medial NAc shell AP +1.3, ML +/-1.6, DV 6.2 from dura (fiber) / 6.4 (virus), 6 degree angle. "
-    "Doric 200 um fibers (B280-2615-10, MFC_200/250-0.66_10mm_MF2.5_FLT)."
-)
-
-# analog channel -> (wavelength nm, hampel key, indicator key, role text)
-CHANNELS = [
-    ("analog_1", 470, "analog1_hampel", "gACh4h",    "gACh4h signal"),
-    ("analog_2", 565, "analog2_hampel", "rDA3m",     "rDA3m signal"),
-    ("analog_3", 405, "analog3_hampel", "reference", "gACh4h reference"),
-]
 
 INDICATOR_INFO = {
     "gACh4h": dict(label="AAV-hSyn-ACh4h3.8",
@@ -113,11 +102,19 @@ COORDS = {
     "mNacSh":  dict(ap=1.3, ml=1.6, dv_fiber=6.2, dv_virus=6.4, angle_deg=6),
 }
 
+# Human-readable region names for the surgery description.
+REGION_DISPLAY = {"NacCore": "NAc core", "mNacSh": "medial NAc shell"}
+
+# analog channel -> (wavelength nm, hampel key, indicator key, role text)
+CHANNELS = [
+    ("analog_1", 470, "analog1_hampel", "gACh4h",    "gACh4h signal"),
+    ("analog_2", 565, "analog2_hampel", "rDA3m",     "rDA3m signal"),
+    ("analog_3", 405, "analog3_hampel", "reference", "gACh4h reference"),
+]
 
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
+##  Helpers
+
 def sanitize(name: str) -> str:
     """Make a string safe/readable for an NWB object name."""
     out = []
@@ -180,9 +177,38 @@ def parse_side(idx, e):
                 hemisphere=hemisphere, hit=hit, target=target)
 
 
-# ----------------------------------------------------------------------------
-# Build the NWB file
-# ----------------------------------------------------------------------------
+def build_surgery(sides):
+    """Build the surgery description from the regions actually targeted this session.
+
+    Only the regions present in `sides` are described, with coordinates pulled from COORDS.
+    Handles bilateral targeting of the same region (e.g. bilateral NAc core) and reports
+    the ML sign(s) for the hemisphere(s) actually implanted.
+    """
+    by_region = {}  # region -> set of hemispheres, preserving first-seen order
+    for s in sides:
+        by_region.setdefault(s["region"], set()).add(s["hemisphere"])
+
+    parts = []
+    for region, hemis in by_region.items():
+        c = COORDS[region]
+        disp = REGION_DISPLAY.get(region, region)
+        if hemis == {"left", "right"}:
+            hemi_txt, ml_txt = "bilateral", f"ML +/-{c['ml']}"
+        elif hemis == {"left"}:
+            hemi_txt, ml_txt = "left", f"ML -{c['ml']}"
+        else:
+            hemi_txt, ml_txt = "right", f"ML +{c['ml']}"
+        angle = "no angle" if c["angle_deg"] == 0 else f"{c['angle_deg']} degree angle"
+        parts.append(f"{hemi_txt} {disp} AP +{c['ap']}, {ml_txt}, "
+                     f"DV {c['dv_fiber']} from dura (fiber) / {c['dv_virus']} (virus), {angle}")
+
+    return (f"NAc fiber photometry. Target coordinates (male, mm from bregma): {'; '.join(parts)}. "
+            "Doric 200 um fibers (B280-2615-10, MFC_200/250-0.66_10mm_MF2.5_FLT).")
+
+
+
+## Build the NWB file
+
 def build_nwb(pkl_path: Path) -> NWBFile:
     with open(pkl_path, "rb") as f:
         data = pickle.load(f)
@@ -196,10 +222,10 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     # Read identity from the pickle rather than hard-coding it.
     sides = [parse_side(i, d) for i, d in enumerate(data)]
     animal_name = str(e0["subject_ID"]).split("_")[0]                  # e.g. "IM1923"
-    mt = re.search(r"Trial[-_](.+?)_COM", str(e0["filename"]))          # e.g. "SF5-Sucrose"
+    mt = re.search(r"Trial[-_](.+?)_COM", str(e0["filename"]))         # e.g. "SF5-Sucrose"
     trial_label = mt.group(1) if mt else "session"
 
-    # ---- Subject (from embedded animal metadata) ----
+    # Subject (from embedded animal metadata)
     dob = pd.Timestamp(e0["DOB"]).to_pydatetime().replace(tzinfo=TZ)
     subject = Subject(
         subject_id=animal_name,
@@ -236,13 +262,13 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         keywords=KEYWORDS,
         subject=subject,
         notes=notes,
-        surgery=SURGERY,
+        surgery=build_surgery(sides),
         virus=VIRUS,
         source_script="convert_sham_feeding_to_nwb.py",
         source_script_file_name="convert_sham_feeding_to_nwb.py",
     )
 
-    # ---- Processing modules ----
+    # Processing modules
     behavior_mod = nwbfile.create_processing_module(
         "behavior", "Lick detection, bottle position, engagement, approach/leave states, lick rates.")
     dlc_mod = nwbfile.create_processing_module(
@@ -250,7 +276,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     meta_mod = nwbfile.create_processing_module(
         "session_metadata", "Per-side scalar metadata, processing configs and QC parameters as tables.")
 
-    # ---- Photometry devices (Thorlabs fiber-coupled LEDs -> Doric FMC6 minicube -> Doric detector) ----
+    # Photometry devices (Thorlabs fiber-coupled LEDs -> Doric FMC6 minicube -> Doric detector)
     exc_sources = {
         470: ExcitationSource(name="Thorlabs 470 nm LED", illumination_type="LED",
                               excitation_wavelength_in_nm=470.0, manufacturer="Thorlabs", model="M470F3",
@@ -310,7 +336,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             nwbfile.add_device(ind)
             indicators[(region, ind_key)] = ind
 
-    # ---- Fiber photometry table: one row per (side, channel) ----
+    # Fiber photometry table: one row per (side, channel)
     fp_table = FiberPhotometryTable(name="fiber_photometry_table",
                                     description="Fiber, indicator and excitation source for each recorded channel.")
     row_index = {}  # (region, analog_key) -> row idx
@@ -337,7 +363,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         return fp_table.create_fiber_photometry_table_region(
             region=[row_index[(region, akey)]], description=f"{akey} @ {region}")
 
-    # ---- Per-side signals & tables ----
+    # Per-side signals & tables
     side_meta_rows = []
     for s in sides:
         e = data[s["idx"]]
@@ -349,7 +375,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         # session-cropped arrays (len 358273) begin at SessionStart_frameNum within the 86 Hz stream
         crop_start = offset + int(e["SessionStart_frameNum"]) / SAMPLING_RATE
 
-        # ----- Raw photometry -> acquisition; filtered + hampel -> ophys module -----
+        # Raw photometry -> acquisition; filtered + hampel -> ophys module
         for akey, wl, hkey, ind_key, role in CHANNELS:
             reg = region_of(akey, region)
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
@@ -372,7 +398,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 unit="V", rate=SAMPLING_RATE, starting_time=offset,
                 fiber_photometry_table_region=region_of(akey, region)))
 
-        # ----- Digital sync + rsync pulse times -----
+        # Digital sync + rsync pulse times
         nwbfile.add_acquisition(TimeSeries(
             name=f"digital_sync_{region}", description=f"Digital sync input (rsync) in {region}.",
             data=np.asarray(e["digital_1"], dtype="int8"), unit="n.a.",
@@ -383,7 +409,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             data=np.ones(len(e["pulse_times_1"]), dtype="int8"), unit="n.a.",
             timestamps=np.asarray(e["pulse_times_1"], dtype="float64") / 1000.0 + offset))
 
-        # ----- Lick / behavior per-sample series (len n, 86 Hz) -----
+        # Lick / behavior per-sample series (len n, 86 Hz)
         full_series = {
             f"lick_binary_{region}": ("LickBinary_2.3", "n.a.",
                 "Binary lick detection (vdiff threshold 2.3); NaN outside detection window."),
@@ -407,7 +433,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 data=np.asarray(e[key], dtype="int8"), unit="n.a.",
                 rate=SAMPLING_RATE, starting_time=offset))
 
-        # ----- Session-cropped series (len ~358273, begin at SessionStart frame) -----
+        # Session-cropped series (len ~358273, begin at SessionStart frame)
         cleaned = e["Cleaned_Head_Distance"]
         m = len(cleaned)
         lb = e["LickBurst_Vars_BurstDefinitionILI_basedThresh2000"]
@@ -442,7 +468,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             data=inc[ev_idx - 1].astype("int16"), unit="licks",
             timestamps=ev_times.astype("float64")))
 
-        # ----- Lick rate time series (1 s / 1 min / 5 min bins) -----
+        # Lick rate time series (1 s / 1 min / 5 min bins)
         for nm, key, rate in [("lickrate_1s", "Lickrate_1s", 1.0),
                               ("lickrate_1m", "Lickrate_1m", 1.0 / 60.0),
                               ("lickrate_5m", "Lickrate_5m", 1.0 / 300.0)]:
@@ -452,7 +478,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 data=np.asarray(lb[key], dtype="float64"), unit="licks/min",
                 rate=rate, starting_time=crop_start))
 
-        # ----- DLC distances + likelihoods (len n, 86 Hz) -----
+        # DLC distances + likelihoods (len n, 86 Hz)
         for key in [k for k in e if k.startswith("DLC_")]:
             unit = "pixels" if "Distance" in key else "probability"
             dlc_mod.add(TimeSeries(
@@ -461,7 +487,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 data=np.asarray(e[key], dtype="float64"), unit=unit,
                 rate=SAMPLING_RATE, starting_time=offset))
 
-        # ----- Per-lick table -----
+        # Per-lick table
         n_licks = lb["NumLicks"]
         lick_df = pd.DataFrame({
             "lick_duration_ms": np.asarray(lb["LickDurations_ms"], dtype="float64"),
@@ -472,7 +498,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             df=lick_df, name=f"lick_table_{region}",
             table_description=f"Per-lick durations and inter-lick intervals in {region} ({n_licks} licks)."))
 
-        # ----- Per-burst table -----
+        # Per-burst table
         n_bursts = lb["NumBursts"]
         burst_df = pd.DataFrame({
             "full_burst_duration_ms": np.asarray(lb["Full_BurstDur"], dtype="float64"),
@@ -486,7 +512,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             table_description=(f"Per-burst stats in {region} (burst threshold "
                               f"{lb['BurstThreshold_ms']} ms, {n_bursts} bursts).")))
 
-        # ----- Raw lick data table (full video-frame resolution) -----
+        # Raw lick data table (full video-frame resolution)
         raw = e["RawLickData"].copy()
         for col in ("AbsTime", "Abs_time2", "True_Absolute_Time"):
             if col in raw.columns:
@@ -498,7 +524,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             table_description=(f"Raw per-frame lick acquisition in {region}. Datetime columns "
                               "(AbsTime, Abs_time2, True_Absolute_Time) are float epoch seconds.")))
 
-        # ----- Side metadata row -----
+        # Side metadata row 
         side_meta_rows.append({
             "side": s["side"], "com_port": s["com"], "region": region, "hemisphere": s["hemisphere"],
             "hit": s["hit"], "target": s["target"],
@@ -535,7 +561,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
 def convert_one(pkl_path: Path):
     print(f"Reading {pkl_path} ...")
     nwbfile = build_nwb(pkl_path)
-    out_path = pkl_path.parent / f"{nwbfile.session_id}.nwb"  # data-driven name from session_id
+    out_path = pkl_path.parent / f"{nwbfile.session_id}.nwb"  # name from session_id
     print(f"Writing {out_path} ...")
     with NWBHDF5IO(out_path, mode="w") as io:
         io.write(nwbfile)
