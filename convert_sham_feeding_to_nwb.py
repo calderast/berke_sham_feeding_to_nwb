@@ -163,13 +163,26 @@ def parse_side(index, side_data):
     Here 'side' is the recording hemisphere (one optical fiber per hemisphere) and
     which port it was recorded from (COM3 or COM4).
 
-    'Full_side_name' is formatted 'COM3_Left_mNacSh' / 'COM4_Right_NacCore'.
-    Hit_*/Target_* and the COM ports are read from the matching L/R fields.
+    'Full_side_name' is formatted 'COM3_Left_mNacSh' / 'COM4_Right_NacCore'. 
+
+    The region part may carry a qualifier when the target was not confirmed by histology 
+    (e.g. 'COM3_Left_Potential_NacCore', with Target_* = 'Potential_NacCore' and Hit_* = 'Unknown').
+
+    Hit_*/Target_* and the COM ports are read from the matching L/R field (i.e. Target_R or Target_L).
     """
-    # Parse Full_side_name to get port (COM3 or COM4), hemisphere (left or right), and brain region
+    # Parse Full_side_name to get port (COM3 or COM4), hemisphere (Left or Right), and region descriptor
     name_parts = str(side_data["Full_side_name"]).split("_")
-    com_port, side_name, region = name_parts[0], name_parts[1], "_".join(name_parts[2:])
+    com_port, side_name, region_descriptor = name_parts[0], name_parts[1], "_".join(name_parts[2:])
     hemisphere = side_name.lower()  # "Left" -> "left", "Right" -> "right"
+
+    # Canonical brain region for coordinate lookup and naming. The descriptor may carry a qualifier
+    # (e.g. "Potential_NacCore"), so match the known region as a suffix.
+    region = next((known for known in COORDS if region_descriptor.endswith(known)), region_descriptor)
+    # Complain if we get confused
+    assert region in COORDS, (
+        f"Unrecognized region '{region_descriptor}' in Full_side_name "
+        f"'{side_data['Full_side_name']}' (known regions: {list(COORDS)})")
+
     # Get region targeted (based on coords) and actually hit (verified via histology) for this hemisphere
     target = side_data["Target_L"] if side_name == "Left" else side_data["Target_R"]
     hit = side_data["Hit_L"] if side_name == "Left" else side_data["Hit_R"]
@@ -389,8 +402,9 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         side_desc = f"{side['hemisphere']} {region}"     # e.g. "left mNacSh", for descriptions
         n_samples = len(side_data["analog_1"])
 
-        # NWB stores each regularly-sampled series as (starting_time, rate); sample i is at
-        # starting_time + i / SAMPLING_RATE. Each dict has two 86 Hz timebases:
+        # NWB stores each regularly-sampled series as (starting_time, rate).
+        # So sample i is at starting_time + i / SAMPLING_RATE. 
+        # Each dict has two 86 Hz timebases:
         #   - the full photometry stream (length n_samples) starts at session_start (starting_time=0);
         #   - the session-cropped arrays (length n_session_samples) trim that stream to the actual session
         #     window, so they start at sample SessionStart_frameNum (e.g. ~2451 -> ~28.5 s in).
