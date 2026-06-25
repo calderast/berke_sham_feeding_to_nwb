@@ -3,7 +3,7 @@ One-time conversion of a Berke Lab sham-feeding session (.pkl) to NWB.
 
 The pickle is a 2-tuple of dicts, one per recording hemisphere ("side"). The two hemispheres are
 recorded simultaneously, each with its own optical fiber on its own serial port (COM3 / COM4), 
-so each hemisphere produces one data dict. All three analog channels within a dict come from that one hemisphere's fiber.
+so each recording hemisphere produces one data dict.
 
 Each dict's side/COM/region identity is read from its own 'Full_side_name' field (e.g. 'COM3_Left_mNacSh').
 The region<->side mapping differs between sessions (e.g. IM1923 has Left=mNacSh/Right=NacCore, 
@@ -14,17 +14,17 @@ derived behavioral layers (lick detection / bursts / rates, DLC head-to-spout
 distances, engagement states, approach/leave events, hampel QC, ...).
 
 PyPhotometry channel mapping:
-    analog_1 -> 470 nm -> gACh4h (green ACh sensor)        signal
-    analog_2 -> 565 nm -> rDA3m  (red dopamine sensor)     signal
-    analog_3 -> 405 nm -> gACh4h reference
+    analog_1 -> 470 nm -> gACh4h (green ACh sensor)         signal
+    analog_2 -> 565 nm -> rDA3m  (red dopamine sensor)      signal
+    analog_3 -> 405 nm -> gACh4h (green ACh sensor)         reference (ratiometric)
 
 Style follows https://github.com/calderast/jdb_to_nwb (convert_photometry.py).
 """
 
-import json
-import pickle
 import re
 import uuid
+import json
+import pickle
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -48,10 +48,10 @@ from ndx_fiber_photometry import (
 )
 
 
-## Constants
+## Metadata for all sessions
 
 TZ = ZoneInfo("America/Los_Angeles")
-SAMPLING_RATE = 86.0  # Hz, pyPhotometry per-channel rate
+SAMPLING_RATE = 86.0  # Hz (pyPhotometry sampling rate)
 
 SPECIES = "Rattus norvegicus"
 INSTITUTION = "University of California, San Francisco"
@@ -59,14 +59,14 @@ LAB = "Berke Lab"
 EXPERIMENTER = ["Slomp, Margo"]
 
 EXPERIMENT_DESCRIPTION = (
-    "Sham-feeding sucrose task with dual-region nucleus accumbens fiber photometry. "
+    "Sham-feeding sucrose task with bilateral nucleus accumbens fiber photometry. "
     "Two fibers record the green acetylcholine sensor gACh4h (470 nm, with 405 nm "
     "reference channel) and the red dopamine sensor rDA3m (565 nm, no reference channel) from two "
     "nucleus accumbens sites (core and/or medial shell; see the 'surgery' field for this session's "
     "targets), while licking at a sucrose spout is detected and the animal's head/nose distance to "
     "the spout is tracked. "
     "Task structure: 10 min baseline (no bottle available), then 60 x 30 s spout-access periods each "
-    "followed by 30 s of no access; a 350 ms 4000 Hz tone marks each trial start. The animal is sham-fed "
+    "followed by 30 s of no access. A 350 ms 4000 Hz tone marks each trial start. The animal is sham-fed "
     "0.8 M sucrose (sham feeding is considered successful when liquid collected in the pan is >= 50% of "
     "the liquid consumed). Apparatus: MedAssociates retractable sipper with Lixit + bottle (ENV-252M) and "
     "MedAssociates grid-floor harness; controlled by Bonsai (incl. video recording), Arduino (lick "
@@ -178,13 +178,17 @@ def parse_side(index, side_data):
     'Full_side_name' is formatted 'COM3_Left_mNacSh' / 'COM4_Right_NacCore'.
     Hit_*/Target_* and the COM ports are read from the matching L/R fields.
     """
+    # Parse Full_side_name to get port (COM3 or COM4), hemisphere (left or right), and brain region
     name_parts = str(side_data["Full_side_name"]).split("_")
     com_port, side_name, region = name_parts[0], name_parts[1], "_".join(name_parts[2:])
     hemisphere = "left" if side_name.lower().startswith("l") else "right"
-    hit = side_data["Hit_L"] if side_name == "Left" else side_data["Hit_R"]
+    # Get region targeted (based on coords) and actually hit (verified via histology) for this hemisphere
     target = side_data["Target_L"] if side_name == "Left" else side_data["Target_R"]
+    hit = side_data["Hit_L"] if side_name == "Left" else side_data["Hit_R"]
+    # Create `label` (e.g. "left_mNacSh") to name this side in NWB objects
+    label = f"{hemisphere}_{region}"
     return dict(index=index, side=side_name, com=com_port, region=region,
-                hemisphere=hemisphere, hit=hit, target=target)
+                hemisphere=hemisphere, hit=hit, target=target, label=label)
 
 
 def build_surgery(sides):
@@ -324,12 +328,13 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                      "exc2 555-570, em2 580-680. FC connectors on all ports."))
     nwbfile.add_device(dichroic_mirror)
 
-    # One optical fiber per hemisphere, and two indicators (gACh4h, rDA3m) injected at each fiber site
-    fibers_by_region = {}
-    indicators_by_region_and_sensor = {}
+    # One optical fiber per recording side, with both indicators (gACh4h, rDA3m) injected at each site.
+    # Keyed by side label (hemisphere+region)
+    fibers_by_side = {}
+    indicators_by_side_and_sensor = {}
     for side in sides:
-        # Region is "NacCore" or "mNacSh", hemisphere is "left" or "right"
-        region, hemisphere = side["region"], side["hemisphere"]
+        # Region is "NacCore" or "mNacSh", hemisphere is "left" or "right", label is e.g. "left_mNacSh"
+        region, hemisphere, side_label = side["region"], side["hemisphere"], side["label"]
         # Get virus and fiber coords for this region
         coords = COORDS[region]
         ml_mm = -coords["ml"] if hemisphere == "left" else coords["ml"]
@@ -346,7 +351,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                          f"AP {fiber_coords[0]}, ML {fiber_coords[1]}, DV {fiber_coords[2]} mm "
                          f"from dura ({angle_label})."))
         nwbfile.add_device(fiber)
-        fibers_by_region[region] = fiber
+        fibers_by_side[side_label] = fiber
 
         for sensor in ("gACh4h", "rDA3m"):
             indicator_info = INDICATOR_INFO[sensor]
@@ -356,43 +361,45 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 manufacturer=indicator_info["manufacturer"], injection_location=region,
                 injection_coordinates_in_mm=virus_coords)
             nwbfile.add_device(indicator)
-            indicators_by_region_and_sensor[(region, sensor)] = indicator
+            indicators_by_side_and_sensor[(side_label, sensor)] = indicator
 
     # Fiber photometry table: one row per (side, channel)
     fiber_table = FiberPhotometryTable(
         name="fiber_photometry_table",
         description="Fiber, indicator and excitation source for each recorded channel.")
-    row_index_by_channel = {}  # (region, analog_key) -> row index
+    row_index_by_channel = {}  # (side_label, analog_key) -> row index
     next_row_index = 0
     for side in sides:
-        region = side["region"]
+        region, side_label = side["region"], side["label"]
         for analog_key, wavelength, _hampel_key, indicator_key, _role in CHANNELS:
             # The 405 reference channel belongs gACh4h (rDA3m has no reference wavelength)
             sensor = "gACh4h" if indicator_key == "reference" else indicator_key
             fiber_table.add_row(
                 location=region,
                 coordinates=side["fiber_coords"],  # AP, ML, DV (mm) of the recording fiber tip
-                optical_fiber=fibers_by_region[region],
+                optical_fiber=fibers_by_side[side_label],
                 photodetector=photodetector,
                 dichroic_mirror=dichroic_mirror,
-                indicator=indicators_by_region_and_sensor[(region, sensor)],
+                indicator=indicators_by_side_and_sensor[(side_label, sensor)],
                 excitation_source=excitation_sources[wavelength],
             )
-            row_index_by_channel[(region, analog_key)] = next_row_index
+            row_index_by_channel[(side_label, analog_key)] = next_row_index
             next_row_index += 1
     nwbfile.add_lab_meta_data(FiberPhotometry(name="fiber_photometry", fiber_photometry_table=fiber_table))
 
-    def channel_table_region(analog_key, region):
+    def channel_table_region(analog_key, side_label):
         """A single-row FiberPhotometryTableRegion pointing at this channel's table row."""
         return fiber_table.create_fiber_photometry_table_region(
-            region=[row_index_by_channel[(region, analog_key)]], description=f"{analog_key} @ {region}")
+            region=[row_index_by_channel[(side_label, analog_key)]], description=f"{analog_key} @ {side_label}")
 
-    # Per-side signals & tables.
-    # Each iteration handles one recording hemisphere's dict (its own photometry + derived layers).
+    # Per-side signals and tables.
+    # Each iteration handles one recording hemisphere's dict (its own photometry + derived layers)
     side_metadata_rows = []
     for side in sides:
         side_data = sides_data[side["index"]]   # the raw pickle dict for this hemisphere
         region = side["region"]
+        side_label = side["label"]                       # e.g. "left_mNacSh", for NWB name suffix
+        side_desc = f"{side['hemisphere']} {region}"     # e.g. "left mNacSh", for descriptions
         n_samples = len(side_data["analog_1"])
 
         # Each dict carries two 86 Hz timebases that we align to the session start:
@@ -408,48 +415,48 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         for analog_key, wavelength, hampel_key, _indicator_key, role in CHANNELS:
             # Raw signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
-                name=f"raw_{wavelength}_{region}",
-                description=f"Raw {role} ({wavelength} nm) in {region}. pyPhotometry {side_data['mode']}.",
+                name=f"raw_{wavelength}_{side_label}",
+                description=f"Raw {role} ({wavelength} nm) in {side_desc}. pyPhotometry {side_data['mode']}.",
                 data=np.asarray(side_data[analog_key], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
-                fiber_photometry_table_region=channel_table_region(analog_key, region)))
+                fiber_photometry_table_region=channel_table_region(analog_key, side_label)))
             # Filtered signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
-                name=f"filt_{wavelength}_{region}",
-                description=f"pyPhotometry-filtered {role} ({wavelength} nm) in {region}.",
+                name=f"filt_{wavelength}_{side_label}",
+                description=f"pyPhotometry-filtered {role} ({wavelength} nm) in {side_desc}.",
                 data=np.asarray(side_data[f"{analog_key}_filt"], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
-                fiber_photometry_table_region=channel_table_region(analog_key, region)))
+                fiber_photometry_table_region=channel_table_region(analog_key, side_label)))
             # Hampel-filtered signal
             nwbfile.add_acquisition(FiberPhotometryResponseSeries(
-                name=f"hampel_{wavelength}_{region}",
-                description=(f"Hampel-filtered {role} ({wavelength} nm) in {region} "
+                name=f"hampel_{wavelength}_{side_label}",
+                description=(f"Hampel-filtered {role} ({wavelength} nm) in {side_desc} "
                             f"(window {side_data['QC']['hampel']['window_sec']}s, "
                             f"{side_data['QC']['hampel']['n_sigmas']} sigma)."),
                 data=np.asarray(side_data[hampel_key], dtype="float64"),
                 unit="V", rate=SAMPLING_RATE, starting_time=stream_offset_s,
-                fiber_photometry_table_region=channel_table_region(analog_key, region)))
+                fiber_photometry_table_region=channel_table_region(analog_key, side_label)))
 
         # Add digital sync + rsync pulse times
         nwbfile.add_acquisition(TimeSeries(
-            name=f"digital_sync_{region}", description=f"Digital sync input (rsync) in {region}.",
+            name=f"digital_sync_{side_label}", description=f"Digital sync input (rsync) in {side_desc}.",
             data=np.asarray(side_data["digital_1"], dtype="int8"), unit="n.a.",
             rate=SAMPLING_RATE, starting_time=stream_offset_s))
         nwbfile.add_acquisition(TimeSeries(
-            name=f"rsync_pulse_times_{region}",
-            description=f"Times of rsync rising edges in {region} (from pyPhotometry pulse_times_1).",
+            name=f"rsync_pulse_times_{side_label}",
+            description=f"Times of rsync rising edges in {side_desc} (from pyPhotometry pulse_times_1).",
             data=np.ones(len(side_data["pulse_times_1"]), dtype="int8"), unit="n.a.",
             timestamps=np.asarray(side_data["pulse_times_1"], dtype="float64") / 1000.0 + stream_offset_s))
 
         # Per-sample behavior series at the full 86 Hz photometry clock (length n_samples).
         per_sample_series = {
-            f"lick_binary_{region}": ("LickBinary_2.3", "n.a.",
+            f"lick_binary_{side_label}": ("LickBinary_2.3", "n.a.",
                 "Binary lick detection (vdiff threshold 2.3); NaN outside detection window."),
-            f"bottle_position_{region}": ("BottlePos", "n.a.",
+            f"bottle_position_{side_label}": ("BottlePos", "n.a.",
                 "Bottle present (1) / absent (0); NaN outside session window."),
-            f"rsync_from_licks_{region}": ("Rsync_aligned-from-licks", "n.a.",
+            f"rsync_from_licks_{side_label}": ("Rsync_aligned-from-licks", "n.a.",
                 "rsync signal aligned from the lick data stream."),
-            f"rsync_interp_from_video_{region}": ("rSync_interpolated_from_video", "n.a.",
+            f"rsync_interp_from_video_{side_label}": ("rSync_interpolated_from_video", "n.a.",
                 "rsync interpolated from the video stream."),
         }
         for series_name, (pickle_key, unit, description) in per_sample_series.items():
@@ -461,9 +468,9 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         # Engagement state vectors (auto + manual thresholds)
         for engagement_key in [key for key in side_data if key.startswith("Engagement")]:
             behavior_module.add(TimeSeries(
-                name=sanitize(f"{engagement_key}_{region}"),
+                name=sanitize(f"{engagement_key}_{side_label}"),
                 description=(f"Engagement state ('{engagement_key}'): "
-                            f"animal engaged with spout (1) or not (0), in {region}."),
+                            f"animal engaged with spout (1) or not (0), in {side_desc}."),
                 data=np.asarray(side_data[engagement_key], dtype="int8"), unit="n.a.",
                 rate=SAMPLING_RATE, starting_time=stream_offset_s))
 
@@ -473,13 +480,13 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         burst_vars = side_data["LickBurst_Vars_BurstDefinitionILI_basedThresh2000"]
         distance_states = side_data["Distance_States_Events"]
         cropped_series = {
-            f"cumulative_licks_{region}": (burst_vars["CumLicks"], "n.a.", "Cumulative lick count."),
-            f"cleaned_head_distance_{region}": (cleaned_head_distance, "pixels",
+            f"cumulative_licks_{side_label}": (burst_vars["CumLicks"], "n.a.", "Cumulative lick count."),
+            f"cleaned_head_distance_{side_label}": (cleaned_head_distance, "pixels",
                 "Cleaned head-to-spout distance (interpolated, jump-corrected)."),
-            f"distance_state_{region}": (distance_states["state"], "n.a.",
+            f"distance_state_{side_label}": (distance_states["state"], "n.a.",
                 "Distance state (0/1/2: near/transition/far per QC settings)."),
-            f"approach_events_{region}": (distance_states["Approach_events"], "n.a.", "Approach transition events."),
-            f"leave_events_{region}": (distance_states["Leave_events"], "n.a.", "Leave transition events."),
+            f"approach_events_{side_label}": (distance_states["Approach_events"], "n.a.", "Approach transition events."),
+            f"leave_events_{side_label}": (distance_states["Leave_events"], "n.a.", "Leave transition events."),
         }
         for series_name, (array, unit, description) in cropped_series.items():
             behavior_module.add(TimeSeries(
@@ -487,7 +494,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 rate=SAMPLING_RATE, starting_time=session_crop_start_s))
         # Labeled burst lick (2D: per-sample burst label)
         behavior_module.add(TimeSeries(
-            name=f"labeled_burst_lick_{region}",
+            name=f"labeled_burst_lick_{side_label}",
             description="Per-sample burst labeling (column 0: in-burst lick flag, column 1: burst id).",
             data=np.asarray(burst_vars["Labeled_BurstLick"], dtype="float64"), unit="n.a.",
             rate=SAMPLING_RATE, starting_time=session_crop_start_s))
@@ -499,7 +506,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         event_indices = np.where(lick_increments > 0)[0] + 1
         event_times = session_crop_start_s + event_indices / SAMPLING_RATE
         behavior_module.add(TimeSeries(
-            name=f"lick_events_{region}",
+            name=f"lick_events_{side_label}",
             description="Detected lick events; data = number of licks registered at each timestamp.",
             data=lick_increments[event_indices - 1].astype("int16"), unit="licks",
             timestamps=event_times.astype("float64")))
@@ -509,7 +516,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                                                     ("lickrate_1m", "Lickrate_1m", 1.0 / 60.0),
                                                     ("lickrate_5m", "Lickrate_5m", 1.0 / 300.0)]:
             behavior_module.add(TimeSeries(
-                name=f"{series_prefix}_{region}",
+                name=f"{series_prefix}_{side_label}",
                 description=f"Lick rate in {series_prefix.split('_')[1]} bins (licks/min).",
                 data=np.asarray(burst_vars[pickle_key], dtype="float64"), unit="licks/min",
                 rate=rate_hz, starting_time=session_crop_start_s))
@@ -518,8 +525,8 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         for dlc_key in [key for key in side_data if key.startswith("DLC_")]:
             unit = "pixels" if "Distance" in dlc_key else "probability"
             dlc_module.add(TimeSeries(
-                name=sanitize(f"{dlc_key}_{region}"),
-                description=f"DeepLabCut '{dlc_key}' in {region}.",
+                name=sanitize(f"{dlc_key}_{side_label}"),
+                description=f"DeepLabCut '{dlc_key}' in {side_desc}.",
                 data=np.asarray(side_data[dlc_key], dtype="float64"), unit=unit,
                 rate=SAMPLING_RATE, starting_time=stream_offset_s))
 
@@ -533,8 +540,8 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             "ili_startend_ms": pad_to(burst_vars["ILI_startend_ms"], n_licks),
         })
         behavior_module.add(DynamicTable.from_dataframe(
-            df=lick_table_df, name=f"lick_table_{region}",
-            table_description=f"Per-lick durations and inter-lick intervals in {region} ({n_licks} licks)."))
+            df=lick_table_df, name=f"lick_table_{side_label}",
+            table_description=f"Per-lick durations and inter-lick intervals in {side_desc} ({n_licks} licks)."))
 
         # Per-burst table (one row per burst)
         n_bursts = burst_vars["NumBursts"]
@@ -547,8 +554,8 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                                          for within_burst_ilis in burst_vars["ILI_withinBursts"]],
         })
         behavior_module.add(DynamicTable.from_dataframe(
-            df=burst_table_df, name=f"burst_table_{region}",
-            table_description=(f"Per-burst stats in {region} (burst threshold "
+            df=burst_table_df, name=f"burst_table_{side_label}",
+            table_description=(f"Per-burst stats in {side_desc} (burst threshold "
                               f"{burst_vars['BurstThreshold_ms']} ms, {n_bursts} bursts).")))
 
         # Raw lick data table (full video-frame resolution)
@@ -561,12 +568,13 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             errors="ignore")
         raw_lick_df["LickFrames_aligned"] = np.asarray(side_data["LickFrames_aligned"], dtype="float64")
         behavior_module.add(DynamicTable.from_dataframe(
-            df=raw_lick_df.reset_index(drop=True), name=f"raw_lick_data_{region}",
-            table_description=(f"Raw per-frame lick acquisition in {region}. Datetime columns "
+            df=raw_lick_df.reset_index(drop=True), name=f"raw_lick_data_{side_label}",
+            table_description=(f"Raw per-frame lick acquisition in {side_desc}. Datetime columns "
                               "(AbsTime, Abs_time2, True_Absolute_Time) are float epoch seconds.")))
 
         # One metadata row per side (scalars, configs, QC parameters as JSON)
         side_metadata_rows.append({
+            "side_label": side_label,
             "side": side["side"], "com_port": side["com"], "region": region, "hemisphere": side["hemisphere"],
             "hit": side["hit"], "target": side["target"],
             "full_side_name": side_data["Full_side_name"],
