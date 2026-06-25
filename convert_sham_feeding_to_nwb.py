@@ -59,12 +59,32 @@ EXPERIMENTER = ["Slomp, Margo"]
 EXPERIMENT_DESCRIPTION = (
     "Sham-feeding sucrose task with dual-region nucleus accumbens fiber photometry. "
     "Two fibers record the green acetylcholine sensor gACh4h (470 nm, with its own 405 nm "
-    "reference channel) and the red dopamine sensor rDA3m (565 nm, no reference channel), one in medial "
-    "NAc shell (mNacSh, left) and one in NAc core (NacCore, right), while licking at a "
-    "sucrose spout is detected and the animal's head/nose distance to the spout is tracked."
+    "reference channel) and the red dopamine sensor rDA3m (565 nm, no reference channel), one in "
+    "NAc core (NacCore) and one in medial NAc shell (mNacSh), while licking at a sucrose spout is "
+    "detected and the animal's head/nose distance to the spout is tracked. "
+    "Task structure: 10 min baseline (no bottle available), then 60 x 30 s spout-access periods each "
+    "followed by 30 s of no access; a 350 ms 4000 Hz tone marks each trial start. The animal is sham-fed "
+    "0.8 M sucrose (sham feeding is considered successful when liquid collected in the pan is >= 50% of "
+    "the liquid consumed). Apparatus: MedAssociates retractable sipper with Lixit + bottle (ENV-252M) and "
+    "MedAssociates grid-floor harness; controlled by Bonsai (incl. video recording), Arduino (lick "
+    "detection and moving spout), and Python with custom scripts. Animals were flushed with heated "
+    "(~body temp) 0.9% NaCl."
 )
 KEYWORDS = ["fiber photometry", "sham feeding", "sucrose", "licking",
             "nucleus accumbens", "dopamine", "acetylcholine", "rDA3m", "gACh4h"]
+
+# Virus / surgery descriptions (same construct + targets for both animals; coordinates are for males).
+VIRUS = (
+    "1:1 mix of two GRAB sensors, each injected undiluted from stock: "
+    "AAV-hSyn-ACh4h3.8 (gACh4h acetylcholine sensor, 1.15e13 vg/mL, BrainVTA) and "
+    "AAV9-hSyn-rDA3m (red-shifted dopamine sensor, 5.89e12 vg/mL, BrainVTA)."
+)
+SURGERY = (
+    "Bilateral NAc fiber photometry. Target coordinates (male, mm from bregma; ML +/- for right/left): "
+    "NAc core AP +1.7, ML +/-1.7, DV 6.8 from dura (fiber) / 7.0 (virus), no angle; "
+    "medial NAc shell AP +1.3, ML +/-1.6, DV 6.2 from dura (fiber) / 6.4 (virus), 6 degree angle. "
+    "Doric 200 um fibers (B280-2615-10, MFC_200/250-0.66_10mm_MF2.5_FLT)."
+)
 
 # analog channel -> (wavelength nm, hampel key, indicator key, role text)
 CHANNELS = [
@@ -74,12 +94,23 @@ CHANNELS = [
 ]
 
 INDICATOR_INFO = {
-    "gACh4h": dict(label="AAV-hSyn-ACh3.8",
-                   description="GRAB-ACh3.8 (gACh4h) acetylcholine sensor under the hSyn promoter",
+    "gACh4h": dict(label="AAV-hSyn-ACh4h3.8",
+                   description=("GRAB gACh4h3.8 acetylcholine sensor under the hSyn promoter. "
+                                "Titer 1.15e13 vg/mL (BrainVTA). Injected undiluted from stock, "
+                                "in a 1:1 mix with rDA3m."),
                    manufacturer="BrainVTA"),
     "rDA3m":  dict(label="AAV9-hSyn-rDA3m",
-                   description="GRAB rDA3m red-shifted dopamine sensor under the hSyn promoter",
+                   description=("GRAB rDA3m red-shifted dopamine sensor under the hSyn promoter. "
+                                "Titer 5.89e12 vg/mL (BrainVTA). Injected undiluted from stock, "
+                                "in a 1:1 mix with gACh4h."),
                    manufacturer="BrainVTA"),
+}
+
+# Stereotaxic targets (male), mm from bregma. ML magnitude; sign is applied per hemisphere.
+# DV differs for the fiber tip (recording) vs the virus injection.
+COORDS = {
+    "NacCore": dict(ap=1.7, ml=1.7, dv_fiber=6.8, dv_virus=7.0, angle_deg=0),
+    "mNacSh":  dict(ap=1.3, ml=1.6, dv_fiber=6.2, dv_virus=6.4, angle_deg=6),
 }
 
 
@@ -205,6 +236,8 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         keywords=KEYWORDS,
         subject=subject,
         notes=notes,
+        surgery=SURGERY,
+        virus=VIRUS,
         source_script="convert_sham_feeding_to_nwb.py",
         source_script_file_name="convert_sham_feeding_to_nwb.py",
     )
@@ -217,46 +250,65 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     meta_mod = nwbfile.create_processing_module(
         "session_metadata", "Per-side scalar metadata, processing configs and QC parameters as tables.")
 
-    # ---- Photometry devices ----
+    # ---- Photometry devices (Thorlabs fiber-coupled LEDs -> Doric FMC6 minicube -> Doric detector) ----
     exc_sources = {
-        470: ExcitationSource(name="Doric Blue LED (470 nm)", illumination_type="LED",
-                              excitation_wavelength_in_nm=470.0, manufacturer="Doric", model="ilFMC7-G2"),
-        565: ExcitationSource(name="Doric Green LED (565 nm)", illumination_type="LED",
-                              excitation_wavelength_in_nm=565.0, manufacturer="Doric", model="ilFMC7-G2"),
-        405: ExcitationSource(name="Doric Purple LED (405 nm)", illumination_type="LED",
-                              excitation_wavelength_in_nm=405.0, manufacturer="Doric", model="ilFMC7-G2"),
+        470: ExcitationSource(name="Thorlabs 470 nm LED", illumination_type="LED",
+                              excitation_wavelength_in_nm=470.0, manufacturer="Thorlabs", model="M470F3",
+                              description="470 nm fiber-coupled LED, 17.2 mW (min), 1000 mA, SMA"),
+        565: ExcitationSource(name="Thorlabs 565 nm LED", illumination_type="LED",
+                              excitation_wavelength_in_nm=565.0, manufacturer="Thorlabs", model="M565F3",
+                              description="565 nm fiber-coupled LED, 9.9 mW (min), 700 mA, SMA"),
+        405: ExcitationSource(name="Thorlabs 405 nm LED", illumination_type="LED",
+                              excitation_wavelength_in_nm=405.0, manufacturer="Thorlabs", model="M405F3",
+                              description=("405 nm fiber-coupled LED, 3.0 mW (min), 500 mA, SMA. Driven by a "
+                                           "separate Thorlabs LED driver (PyBoard controls only 2 LEDs).")),
     }
     for src in exc_sources.values():
         nwbfile.add_device(src)
 
     photodetector = Photodetector(
-        name="Doric ilFMC7-G2", detector_type="Silicon photodiode",
-        detected_wavelength_in_nm=960.0, manufacturer="Doric", model="ilFMC7-G2",
-        description="Integrated LED Fluorescence Mini Cube (5 ports, Gen.2)",
+        name="Doric Fluorescence Detector", detector_type="Silicon photodiode",
+        detected_wavelength_in_nm=600.0, manufacturer="Doric", serial_number="192201-01",
+        description="Doric fluorescence detector (s/n 192201-01).",
     )
     nwbfile.add_device(photodetector)
+    # The Doric FMC6 minicube provides the excitation/emission/dichroic filtering; represented as a DichroicMirror.
     dichroic = DichroicMirror(
-        name="Doric ilFMC7-G2 Built-in Dichroic Mirror",
-        description="Built-in dichroic mirror of the ilFMC7-G2 minicube", manufacturer="Doric")
+        name="Doric FMC6 Minicube",
+        manufacturer="Doric",
+        model=("FMC6_IE(400-410)_E1(460-490)_F1(500-540)_E2(555-570)_F2(580-680)_S"),
+        description=("Doric 6-port Fluorescence Mini Cube (GCaMP + red fluorophore), Gen 1 (~2015). "
+                     "Filter bands (nm): isosbestic exc 400-410, exc1 460-490, em1 500-540, "
+                     "exc2 555-570, em2 580-680. FC connectors on all ports."))
     nwbfile.add_device(dichroic)
 
     fibers, indicators = {}, {}
     for s in sides:
+        region, hemi = s["region"], s["hemisphere"]
+        c = COORDS[region]
+        ml = (-c["ml"] if hemi == "left" else c["ml"])
+        fiber_coords = (c["ap"], ml, c["dv_fiber"])     # AP, ML, DV (mm) of the fiber tip
+        virus_coords = (c["ap"], ml, c["dv_virus"])     # AP, ML, DV (mm) of the virus injection
+        s["fiber_coords"] = fiber_coords
+
+        angle_txt = "no angle" if c["angle_deg"] == 0 else f"{c['angle_deg']} degree angle"
         fiber = OpticalFiber(
-            name=f"Doric 0.66mm Flat 40mm Optic Fiber ({s['hemisphere']} {s['region']})",
-            manufacturer="Doric", model="MFC_200/250-0.66_40mm_MF2.5_FLT",
+            name=f"Doric 200um 10mm Optic Fiber ({hemi} {region})",
+            manufacturer="Doric", model="MFC_200/250-0.66_10mm_MF2.5_FLT",
             numerical_aperture=0.66, core_diameter_in_um=200.0,
-            description=f"Recording fiber implanted in {s['hemisphere']} {s['region']}")
+            description=(f"Doric 200 um fiber (B280-2615-10) implanted in {hemi} {region} at "
+                         f"AP {fiber_coords[0]}, ML {fiber_coords[1]}, DV {fiber_coords[2]} mm from dura ({angle_txt})."))
         nwbfile.add_device(fiber)
-        fibers[s["region"]] = fiber
+        fibers[region] = fiber
         for ind_key in ("gACh4h", "rDA3m"):
             info = INDICATOR_INFO[ind_key]
             ind = Indicator(
-                name=f"{ind_key} ({s['hemisphere']} {s['region']})",
+                name=f"{ind_key} ({hemi} {region})",
                 label=info["label"], description=info["description"],
-                manufacturer=info["manufacturer"], injection_location=s["region"])
+                manufacturer=info["manufacturer"], injection_location=region,
+                injection_coordinates_in_mm=virus_coords)
             nwbfile.add_device(ind)
-            indicators[(s["region"], ind_key)] = ind
+            indicators[(region, ind_key)] = ind
 
     # ---- Fiber photometry table: one row per (side, channel) ----
     fp_table = FiberPhotometryTable(name="fiber_photometry_table",
@@ -270,6 +322,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             indicator_obj = indicators[(region, "gACh4h" if ind_key == "reference" else ind_key)]
             fp_table.add_row(
                 location=region,
+                coordinates=s["fiber_coords"],  # AP, ML, DV (mm) of the recording fiber tip
                 optical_fiber=fibers[region],
                 photodetector=photodetector,
                 dichroic_mirror=dichroic,
@@ -447,10 +500,14 @@ def build_nwb(pkl_path: Path) -> NWBFile:
 
         # ----- Side metadata row -----
         side_meta_rows.append({
-            "side": s["side"], "com_port": s["com"], "region": region,
+            "side": s["side"], "com_port": s["com"], "region": region, "hemisphere": s["hemisphere"],
             "hit": s["hit"], "target": s["target"],
             "full_side_name": e["Full_side_name"],
             "indicator_470nm": "gACh4h", "indicator_565nm": "rDA3m", "reference_405nm": "gACh4h reference",
+            "fiber_coords_ap_ml_dv_mm_json": json_str(list(s["fiber_coords"])),
+            "virus_coords_ap_ml_dv_mm_json": json_str([COORDS[region]["ap"],
+                                                       s["fiber_coords"][1], COORDS[region]["dv_virus"]]),
+            "implant_angle_deg": int(COORDS[region]["angle_deg"]),
             "ppd_filename": e["filename"],
             "mode": e["mode"], "sampling_rate_hz": float(e["sampling_rate"]),
             "led_current_mA_json": json_str(e["LED_current"]),
