@@ -808,15 +808,23 @@ def save_qc_outputs(nwb, output_dir):
     # ------- Both-sides figures (one vertical subplot per side) -------
     n_sides = len(sides)
 
-    # rsync inter-pulse interval, one subplot per side
-    fig, axes = plt.subplots(n_sides, 1, figsize=(13, 3 * n_sides))
+    # rsync inter-pulse interval, one subplot per side. Bin on the 86 Hz sample grid (one bin per
+    # integer sample gap = 1000/86 ms) and share bins across sides, so each box's pulses land on the
+    # same bins and the +/-1-sample digitization jitter is directly comparable between sides.
+    sample_ms = 1000.0 / SAMPLING_RATE
+    inter_pulse_by_side = {
+        side_label: np.diff(np.asarray(nwb.acquisition[f"rsync_pulse_times_{side_label}"].timestamps[:]) * 1000)
+        for side_label, _ in sides
+    }
+    gaps_in_samples = np.concatenate([np.round(ipi / sample_ms) for ipi in inter_pulse_by_side.values()])
+    bin_edges = (np.arange(gaps_in_samples.min(), gaps_in_samples.max() + 2) - 0.5) * sample_ms
+    fig, axes = plt.subplots(n_sides, 1, figsize=(13, 3 * n_sides), sharex=True)
     for axis, (side_label, side_name) in zip(np.atleast_1d(axes), sides):
-        pulse_times_s = np.asarray(nwb.acquisition[f"rsync_pulse_times_{side_label}"].timestamps[:])
-        inter_pulse_ms = np.diff(pulse_times_s) * 1000
-        axis.hist(inter_pulse_ms, bins=60)
+        inter_pulse_ms = inter_pulse_by_side[side_label]
+        axis.hist(inter_pulse_ms, bins=bin_edges)
         axis.set_ylabel("count")
         axis.set_title(f"{side_name}: rsync inter-pulse interval, n={len(inter_pulse_ms)}", fontsize=9)
-    np.atleast_1d(axes)[-1].set_xlabel("ms")
+    np.atleast_1d(axes)[-1].set_xlabel("ms (binned on the 86 Hz sample grid)")
     save(fig, "sync.png", "rsync inter-pulse interval", "both sides")
 
     # Bottle / trial structure, one subplot per side
