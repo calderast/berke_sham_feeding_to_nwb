@@ -799,9 +799,12 @@ def save_qc_outputs(nwb, output_dir):
         bottle = behavior[f"bottle_position_{side_label}"]
         state = behavior[f"distance_state_{side_label}"]
         state_t_min = time_vector(state) / 60
-        auto_engagement_key = [k for k in behavior.data_interfaces if k.startswith("Engagement")
-                               and "auto" in k and "head" in k and k.endswith(side_label)][0]
-        auto_engagement = behavior[auto_engagement_key]
+        # Prefer the auto head-to-spout engagement vector; fall back to any engagement vector for this
+        # side, or None if the session has none (e.g. a side with missing DLC).
+        side_engagement_keys = [k for k in behavior.data_interfaces
+                                if k.startswith("Engagement") and k.endswith(side_label)]
+        auto_engagement_key = next((k for k in side_engagement_keys if "auto" in k and "head" in k),
+                                   side_engagement_keys[0] if side_engagement_keys else None)
         full_t_min = time_vector(rda) / 60
         window_start = full_t_min[-1] / 2
         window_end = min(window_start + 5, full_t_min[-1])
@@ -812,7 +815,10 @@ def save_qc_outputs(nwb, output_dir):
         axes[1].plot(full_t_min[in_window], ach.data[:][in_window], color="#2CA02C", lw=0.7); axes[1].set_ylabel("gACh4h (V)")
         axes[2].fill_between(full_t_min[in_window], 0, np.nan_to_num(lick_binary.data[:])[in_window], step="mid", color="k"); axes[2].set_ylabel("lick")
         axes[3].fill_between(full_t_min[in_window], 0, np.nan_to_num(bottle.data[:])[in_window], step="mid", color="tab:blue"); axes[3].set_ylabel("bottle")
-        axes[4].fill_between(full_t_min[in_window], 0, auto_engagement.data[:][in_window], step="mid", color="tab:orange"); axes[4].set_ylabel("engaged")
+        if auto_engagement_key is not None:
+            engaged = behavior[auto_engagement_key].data[:]
+            axes[4].fill_between(full_t_min[in_window], 0, engaged[in_window], step="mid", color="tab:orange")
+        axes[4].set_ylabel("engaged")
         axes[5].plot(state_t_min[state_in_window], state.data[:][state_in_window], lw=0.8, color="tab:purple"); axes[5].set_ylabel("state")
         axes[5].set_xlabel("time (min)")
         save(fig, f"session_overview_{side_name}.png",
@@ -903,7 +909,13 @@ def convert_one(pkl_path: Path):
               f"acquisition: {len(nwb.acquisition)}, "
               f"behavior: {len(nwb.processing['behavior'].data_interfaces)}, "
               f"dlc: {len(nwb.processing['dlc'].data_interfaces)}")
-        save_qc_outputs(nwb, out_path.parent)
+        # QC figures/inventory are best-effort: the NWB is already written, so a plotting failure
+        # is a warning, not a conversion failure.
+        try:
+            save_qc_outputs(nwb, out_path.parent)
+        except Exception:
+            print(f"  (warning) NWB written OK, but QC figures/inventory failed for {nwb.session_id}:")
+            traceback.print_exc()
 
 
 def collect_pickles(paths):
