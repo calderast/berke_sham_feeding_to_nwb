@@ -159,6 +159,22 @@ def pad_to(array, length):
     return np.concatenate([array, np.full(length - len(array), np.nan)])
 
 
+def to_float(value):
+    """Parse to float, or NaN if not numeric (some fields use a placeholder like '--' for none)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def grams_label(value):
+    """Format a grams value as 'X.XX g', or pass a non-numeric placeholder (e.g. '--') through."""
+    try:
+        return f"{float(value):.2f} g"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def parse_side(index, side_data):
     """Derive a recording side's identity from the pickle dict.
 
@@ -264,8 +280,8 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         for side in sides)
     notes = (
         f"Sham-feeding {trial_label} trial. {hemisphere_descriptions}. "
-        f"Grams consumed: {first_side_data['GramConsumed']:.2f} g; "
-        f"grams in pan: {first_side_data['GramInPan']:.2f} g. "
+        f"Grams consumed: {grams_label(first_side_data['GramConsumed'])}; "
+        f"grams in pan: {grams_label(first_side_data['GramInPan'])}. "
         f"pyPhotometry mode '{first_side_data['mode']}', sampling rate {first_side_data['sampling_rate']} Hz, "
         f"LED current {first_side_data['LED_current']} mA, "
         f"volts/division {first_side_data['volts_per_division']}."
@@ -592,7 +608,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             "mode": side_data["mode"], "sampling_rate_hz": float(side_data["sampling_rate"]),
             "led_current_mA_json": json_str(side_data["LED_current"]),
             "volts_per_division_json": json_str(side_data["volts_per_division"]),
-            "grams_consumed": float(side_data["GramConsumed"]), "grams_in_pan": float(side_data["GramInPan"]),
+            "grams_consumed": to_float(side_data["GramConsumed"]), "grams_in_pan": to_float(side_data["GramInPan"]),
             "num_licks": int(burst_vars["NumLicks"]), "num_bursts": int(burst_vars["NumBursts"]),
             "burst_threshold_ms": int(burst_vars["BurstThreshold_ms"]),
             "session_start_frame": int(side_data["SessionStart_frameNum"]),
