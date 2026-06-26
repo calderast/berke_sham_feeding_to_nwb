@@ -20,10 +20,10 @@ Style follows https://github.com/calderast/jdb_to_nwb (convert_photometry.py).
 """
 
 import re
-import sys
 import uuid
 import json
 import pickle
+import argparse
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -686,10 +686,6 @@ def save_qc_outputs(nwb, output_dir):
     every saved figure carries the NWB filename in its suptitle. Per-side figures are saved once per
     recording side; the trial / engagement / state / sync figures stack both sides as vertical subplots.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     nwb_name = f"{nwb.session_id}.nwb"
     fig_dir = output_dir / f"{nwb.session_id}_figures"
     fig_dir.mkdir(exist_ok=True)
@@ -705,7 +701,7 @@ def save_qc_outputs(nwb, output_dir):
         fig.savefig(fig_dir / name, dpi=110, bbox_inches="tight")
         plt.close(fig)
 
-    # ------- Per-side figures -------
+    # Per-side figures
     for side_label, side_name in sides:
         # Photometry: one figure per processing level, one subplot per wavelength
         for level, prefix in [("raw", "raw"), ("filtered", "filt"), ("hampel", "hampel")]:
@@ -805,7 +801,7 @@ def save_qc_outputs(nwb, output_dir):
         save(fig, f"session_overview_{side_name}.png",
              f"session overview ({window_start:.0f}-{window_end:.0f} min)", side_name)
 
-    # ------- Both-sides figures (one vertical subplot per side) -------
+    # Both-sides figures (one vertical subplot per side)
     n_sides = len(sides)
 
     # rsync inter-pulse interval, one subplot per side. Bin on the 86 Hz sample grid (one bin per
@@ -893,14 +889,38 @@ def convert_one(pkl_path: Path):
         save_qc_outputs(nwb, out_path.parent)
 
 
+def collect_pickles(paths):
+    """Expand the given paths into a sorted list of *_lickprocessed.pkl files.
+
+    Each path may be a directory (searched for *_lickprocessed.pkl) or an individual .pkl file.
+    """
+    pkl_paths = []
+    for path in paths:
+        path = Path(path).expanduser()
+        if path.is_dir():
+            pkl_paths += sorted(path.glob("*_lickprocessed.pkl"))
+        elif path.is_file():
+            pkl_paths.append(path)
+        else:
+            print(f"Skipping {path}: not a file or directory")
+    return pkl_paths
+
+
 def main():
-    # Convert the pickle(s) given on the command line, or every *_lickprocessed.pkl
-    # in this directory if none are given.
-    given_paths = [Path(p) for p in sys.argv[1:]]
-    pkl_paths = given_paths or sorted(Path(__file__).parent.glob("*_lickprocessed.pkl"))
+    parser = argparse.ArgumentParser(
+        description="Convert Berke sham-feeding *_lickprocessed.pkl files to NWB. "
+                    "Each NWB (and its QC figures/inventory) is written next to its source pickle.")
+    parser.add_argument(
+        "paths", nargs="*", default=["."],
+        help="Directories to search for *_lickprocessed.pkl, and/or individual .pkl files "
+             "(default: the current directory).")
+    args = parser.parse_args()
+
+    pkl_paths = collect_pickles(args.paths)
     if not pkl_paths:
-        print("No pickle files given and no *_lickprocessed.pkl found in this directory.")
+        print("No *_lickprocessed.pkl files found.")
         return
+    print(f"Found {len(pkl_paths)} pickle file(s) to convert.")
     for pkl_path in pkl_paths:
         convert_one(pkl_path)
 
