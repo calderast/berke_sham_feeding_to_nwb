@@ -24,6 +24,7 @@ import uuid
 import json
 import pickle
 import argparse
+import traceback
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -937,8 +938,23 @@ def main():
         print("No *_lickprocessed.pkl files found.")
         return
     print(f"Found {len(pkl_paths)} pickle file(s) to convert.")
+
+    # Convert each file independently: if one fails, complain (with traceback) and keep going.
+    failed = []
     for pkl_path in pkl_paths:
-        convert_one(pkl_path)
+        try:
+            convert_one(pkl_path)
+        except Exception:
+            print(f"\n!!! FAILED to convert {pkl_path} -- skipping. Traceback:")
+            traceback.print_exc()
+            failed.append(pkl_path)
+
+    n_ok = len(pkl_paths) - len(failed)
+    print(f"\nConverted {n_ok}/{len(pkl_paths)} file(s).")
+    if failed:
+        print("Failed:")
+        for pkl_path in failed:
+            print(f"  {pkl_path}")
 
 
 if __name__ == "__main__":
