@@ -6,8 +6,6 @@ recorded simultaneously, each with its own optical fiber on its own serial port 
 so each recording hemisphere produces one data dict.
 
 Each dict's side/COM/region identity is read from its own 'Full_side_name' field (e.g. 'COM3_Left_mNacSh').
-The region<->side mapping differs between sessions (e.g. IM1923 has Left=mNacSh/Right=NacCore, 
-while IM1929 has Left=NacCore/Right=mNacSh).
 
 Each side holds pyPhotometry "3EX_2EM_pulsed" data at 86 Hz plus a large stack of
 derived behavioral layers (lick detection / bursts / rates, DLC head-to-spout
@@ -168,7 +166,7 @@ def parse_side(index, side_data):
     The region part may carry a qualifier when the target was not confirmed by histology 
     (e.g. 'COM3_Left_Potential_NacCore', with Target_* = 'Potential_NacCore' and Hit_* = 'Unknown').
 
-    Hit_*/Target_* and the COM ports are read from the matching L/R field (i.e. Target_R or Target_L).
+    Hit_* / Target_* and the COM ports are read from the matching L/R field (i.e. Target_R or Target_L).
     """
     # Parse Full_side_name to get port (COM3 or COM4), hemisphere (Left or Right), and region descriptor
     name_parts = str(side_data["Full_side_name"]).split("_")
