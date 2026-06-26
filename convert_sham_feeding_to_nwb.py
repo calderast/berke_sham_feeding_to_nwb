@@ -32,13 +32,14 @@ from zoneinfo import ZoneInfo
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 import numpy as np
 import pandas as pd
 
 from pynwb import NWBFile, NWBHDF5IO, TimeSeries
 from pynwb.file import Subject
-from hdmf.common import DynamicTable
+from hdmf.common import DynamicTable, VectorData
 
 from ndx_fiber_photometry import (
     FiberPhotometryResponseSeries,
@@ -56,6 +57,11 @@ from ndx_fiber_photometry import (
 
 TZ = ZoneInfo("America/Los_Angeles")
 SAMPLING_RATE = 86.0  # Hz (pyPhotometry sampling rate)
+
+# Lick-burst stats live under this key; its "...Thresh2000" suffix is the burst-definition ILI
+# threshold in ms. A no-lick session omits BurstThreshold_ms, so fall back to that 2000 ms
+BURST_VARS_KEY = "LickBurst_Vars_BurstDefinitionILI_basedThresh2000"
+DEFAULT_BURST_THRESHOLD_MS = 2000
 
 SPECIES = "Rattus norvegicus"
 INSTITUTION = "University of California, San Francisco"
@@ -158,6 +164,24 @@ def pad_to(array, length):
     if len(array) >= length:
         return array[:length]
     return np.concatenate([array, np.full(length - len(array), np.nan)])
+
+
+def table_from_dataframe(df, name, description):
+    """DynamicTable from a dataframe, tolerating the 0-row case.
+
+    DynamicTable.from_dataframe peeks at df[col].iloc[0] to infer each column, so it raises on an
+    empty dataframe. A session with no recorded licks yields empty lick/burst tables, so build those
+    from explicitly-typed empty columns ('U' text for object columns, the column dtype otherwise --
+    HDMF needs a concrete dtype, which it can't infer from zero rows).
+    """
+    if len(df) == 0:
+        columns = [
+            VectorData(name=column, description=column,
+                       data=np.array([], dtype="U" if df[column].dtype == object else df[column].dtype))
+            for column in df.columns
+        ]
+        return DynamicTable(name=name, description=description, columns=columns)
+    return DynamicTable.from_dataframe(df=df, name=name, table_description=description)
 
 
 def to_float(value):
@@ -279,13 +303,22 @@ def build_nwb(pkl_path: Path) -> NWBFile:
     hemisphere_descriptions = "; ".join(
         f"{side['side']} hemisphere ({side['com']}) recorded from {side['region']} (target {side['target']})"
         for side in sides)
+
+    # Flag sessions with no recorded licks: their lick/burst tables are empty and lick-rate series absent
+    no_lick_sides = [side for side in sides
+                     if int(sides_data[side["index"]][BURST_VARS_KEY]["NumLicks"]) == 0]
+    if not no_lick_sides:
+        no_lick_note = ""
+    else:
+        no_lick_note = " NOTE: NO LICKS WERE RECORDED THIS SESSION."
+
     notes = (
         f"Sham-feeding {trial_label} trial. {hemisphere_descriptions}. "
         f"Grams consumed: {grams_label(first_side_data['GramConsumed'])}; "
         f"grams in pan: {grams_label(first_side_data['GramInPan'])}. "
         f"pyPhotometry mode '{first_side_data['mode']}', sampling rate {first_side_data['sampling_rate']} Hz, "
         f"LED current {first_side_data['LED_current']} mA, "
-        f"volts/division {first_side_data['volts_per_division']}."
+        f"volts/division {first_side_data['volts_per_division']}.{no_lick_note}"
     )
 
     nwbfile = NWBFile(
@@ -500,7 +533,7 @@ def build_nwb(pkl_path: Path) -> NWBFile:
         # Session-cropped series (length n_session_samples), starting at the SessionStart frame.
         cleaned_head_distance = side_data["Cleaned_Head_Distance"]
         n_session_samples = len(cleaned_head_distance)
-        burst_vars = side_data["LickBurst_Vars_BurstDefinitionILI_basedThresh2000"]
+        burst_vars = side_data[BURST_VARS_KEY]
         distance_states = side_data["Distance_States_Events"]
         cropped_series = {
             f"cumulative_licks_{side_label}": (burst_vars["CumLicks"], "n.a.", "Cumulative lick count."),
@@ -533,16 +566,31 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             description="Detected lick events; data = number of licks registered at each timestamp.",
             data=lick_increments[event_indices - 1].astype("int16"), unit="licks",
             timestamps=event_times.astype("float64")))
-
+ 
         # Lick rate time series (1 s / 1 min / 5 min bins)
-        for series_prefix, pickle_key, rate_hz in [("lickrate_1s", "Lickrate_1s", 1.0),
-                                                    ("lickrate_1m", "Lickrate_1m", 1.0 / 60.0),
-                                                    ("lickrate_5m", "Lickrate_5m", 1.0 / 300.0)]:
-            behavior_module.add(TimeSeries(
-                name=f"{series_prefix}_{side_label}",
-                description=f"Lick rate in {series_prefix.split('_')[1]} bins (licks/min).",
-                data=np.asarray(burst_vars[pickle_key], dtype="float64"), unit="licks/min",
-                rate=rate_hz, starting_time=session_crop_start_s))
+        lickrate_specs = [
+            ("lickrate_1s", "Lickrate_1s", 1.0),
+            ("lickrate_1m", "Lickrate_1m", 1.0 / 60.0),
+            ("lickrate_5m", "Lickrate_5m", 1.0 / 300.0),
+        ]
+        # Complain if we don't have lick data, but don't error 
+        # (Some sessions had issues with licks being recorded but we want to convert anyway)
+        if all(burst_vars.get(pickle_key) is None for _, pickle_key, _ in lickrate_specs):
+            print(f"  No lick-rate series for {side_desc} (no licks recorded); skipping.")
+        for series_prefix, pickle_key, rate_hz in lickrate_specs:
+            data = burst_vars.get(pickle_key)
+            if data is None:
+                continue
+            behavior_module.add(
+                TimeSeries(
+                    name=f"{series_prefix}_{side_label}",
+                    description=f"Lick rate in {series_prefix.split('_')[1]} bins (licks/min).",
+                    data=np.asarray(data, dtype="float64"),
+                    unit="licks/min",
+                    rate=rate_hz,
+                    starting_time=session_crop_start_s,
+                )
+            )
 
         # DLC distances + likelihoods (length n_samples, 86 Hz)
         for dlc_key in [key for key in side_data if key.startswith("DLC_")]:
@@ -553,33 +601,38 @@ def build_nwb(pkl_path: Path) -> NWBFile:
                 data=np.asarray(side_data[dlc_key], dtype="float64"), unit=unit,
                 rate=SAMPLING_RATE, starting_time=0.0))
 
-        # Per-lick table (one row per lick). 
-        # There are n_licks durations but only n_licks-1 inter-lick intervals, 
-        # so the interval columns are NaN-padded out to n_licks.
+        # Per-lick / per-burst stats. A session with no recorded licks carries only NumLicks (0),
+        # CumLicks and Labeled_BurstLick in burst_vars; the per-lick and per-burst stat arrays are
+        # absent, so default each to empty and emit 0-row tables.
         n_licks = burst_vars["NumLicks"]
+        n_bursts = burst_vars.get("NumBursts", 0)
+        burst_threshold_ms = int(burst_vars.get("BurstThreshold_ms", DEFAULT_BURST_THRESHOLD_MS))
+
+        # Per-lick table (one row per lick).
+        # There are n_licks durations but only n_licks-1 inter-lick intervals,
+        # so the interval columns are NaN-padded out to n_licks.
         lick_table_df = pd.DataFrame({
-            "lick_duration_ms": np.asarray(burst_vars["LickDurations_ms"], dtype="float64"),
-            "interlick_interval_ms": pad_to(burst_vars["InterlickInterval_ms"], n_licks),
-            "ili_startend_ms": pad_to(burst_vars["ILI_startend_ms"], n_licks),
+            "lick_duration_ms": np.asarray(burst_vars.get("LickDurations_ms", []), dtype="float64"),
+            "interlick_interval_ms": pad_to(burst_vars.get("InterlickInterval_ms", []), n_licks),
+            "ili_startend_ms": pad_to(burst_vars.get("ILI_startend_ms", []), n_licks),
         })
-        behavior_module.add(DynamicTable.from_dataframe(
-            df=lick_table_df, name=f"lick_table_{side_label}",
-            table_description=f"Per-lick durations and inter-lick intervals in {side_desc} ({n_licks} licks)."))
+        behavior_module.add(table_from_dataframe(
+            lick_table_df, name=f"lick_table_{side_label}",
+            description=f"Per-lick durations and inter-lick intervals in {side_desc} ({n_licks} licks)."))
 
         # Per-burst table (one row per burst)
-        n_bursts = burst_vars["NumBursts"]
         burst_table_df = pd.DataFrame({
-            "full_burst_duration_ms": np.asarray(burst_vars["Full_BurstDur"], dtype="float64"),
-            "lick_burst_duration_ms": np.asarray(burst_vars["Lick_BurstDur"], dtype="float64"),
-            "avg_licks_per_burst": np.asarray(burst_vars["Avg_LicksPerBurst"], dtype="float64"),
-            "ili_between_bursts_ms": pad_to(burst_vars["ILI_betweenBursts"], n_bursts),
+            "full_burst_duration_ms": np.asarray(burst_vars.get("Full_BurstDur", []), dtype="float64"),
+            "lick_burst_duration_ms": np.asarray(burst_vars.get("Lick_BurstDur", []), dtype="float64"),
+            "avg_licks_per_burst": np.asarray(burst_vars.get("Avg_LicksPerBurst", []), dtype="float64"),
+            "ili_between_bursts_ms": pad_to(burst_vars.get("ILI_betweenBursts", []), n_bursts),
             "ili_within_burst_ms_json": [json_str(np.asarray(within_burst_ilis).tolist())
-                                         for within_burst_ilis in burst_vars["ILI_withinBursts"]],
+                                         for within_burst_ilis in burst_vars.get("ILI_withinBursts", [])],
         })
-        behavior_module.add(DynamicTable.from_dataframe(
-            df=burst_table_df, name=f"burst_table_{side_label}",
-            table_description=(f"Per-burst stats in {side_desc} (burst threshold "
-                              f"{burst_vars['BurstThreshold_ms']} ms, {n_bursts} bursts).")))
+        behavior_module.add(table_from_dataframe(
+            burst_table_df, name=f"burst_table_{side_label}",
+            description=(f"Per-burst stats in {side_desc} (burst threshold "
+                        f"{burst_threshold_ms} ms, {n_bursts} bursts).")))
 
         # Raw lick data table (full video-frame resolution)
         raw_lick_df = side_data["RawLickData"].copy()
@@ -610,8 +663,8 @@ def build_nwb(pkl_path: Path) -> NWBFile:
             "led_current_mA_json": json_str(side_data["LED_current"]),
             "volts_per_division_json": json_str(side_data["volts_per_division"]),
             "grams_consumed": to_float(side_data["GramConsumed"]), "grams_in_pan": to_float(side_data["GramInPan"]),
-            "num_licks": int(burst_vars["NumLicks"]), "num_bursts": int(burst_vars["NumBursts"]),
-            "burst_threshold_ms": int(burst_vars["BurstThreshold_ms"]),
+            "num_licks": int(n_licks), "num_bursts": int(n_bursts),
+            "burst_threshold_ms": burst_threshold_ms,
             "session_start_frame": int(side_data["SessionStart_frameNum"]),
             "session_end_frame": int(side_data["SessionEnd_frameNum"]),
             "bottle_in_frame": int(side_data["BottleIn_frameNum"]),
@@ -711,6 +764,7 @@ def save_qc_outputs(nwb, output_dir):
     dlc = nwb.processing["dlc"]
     side_metadata = nwb.processing["session_metadata"]["session_side_metadata"].to_dataframe()
     sides = [(row["side_label"], row["full_side_name"]) for _, row in side_metadata.iterrows()]
+    threshold_by_side = dict(zip(side_metadata["side_label"], side_metadata["burst_threshold_ms"]))
 
     def save(fig, name, description, side_name):
         fig.suptitle(f"{nwb_name}   --   {description}   --   {side_name}")
@@ -737,25 +791,58 @@ def save_qc_outputs(nwb, output_dir):
         axes[0].set_title("Cumulative licks"); axes[0].set_xlabel("time (min)")
         for axis, (rate_key, label) in zip(axes[1:], [("lickrate_1s", "1 s"), ("lickrate_1m", "1 min"),
                                                       ("lickrate_5m", "5 min")]):
+            axis.set_ylabel("licks/min"); axis.set_title(f"Lick rate ({label} bins)"); axis.set_xlabel("time (min)")
+            # A no-lick session omits the lick-rate series, leaving an empty subplot.
+            if f"{rate_key}_{side_label}" not in behavior.data_interfaces:
+                continue
             rate = behavior[f"{rate_key}_{side_label}"]
             axis.plot(time_vector(rate) / 60, rate.data[:], lw=0.8)
-            axis.set_ylabel("licks/min"); axis.set_title(f"Lick rate ({label} bins)"); axis.set_xlabel("time (min)")
         save(fig, f"licks_{side_name}.png", "licking overview", side_name)
 
         # Burst structure: from the lick and burst tables
         burst_df = behavior[f"burst_table_{side_label}"].to_dataframe()
         lick_df = behavior[f"lick_table_{side_label}"].to_dataframe()
         within_burst_ilis = [v for s in burst_df["ili_within_burst_ms_json"] for v in json.loads(s)]
+        between_burst_ilis = burst_df["ili_between_bursts_ms"].dropna()
         fig, axes = plt.subplots(2, 2, figsize=(13, 7))
-        axes[0, 0].hist(lick_df["lick_duration_ms"].dropna(), bins=80); axes[0, 0].set_title("Lick durations (ms)"); axes[0, 0].set_xlim(0, 200)
+
+        # Lick durations are quantized to the 86 Hz sample (multiples of ~11.6 ms)
+        # Scale x to the actual scale of the data (should be only really be 11.6, 23.2, and 34.8)
+        lick_durations = lick_df["lick_duration_ms"].dropna()
+        duration_hi = float(np.nanpercentile(lick_durations, 99)) * 1.5 if len(lick_durations) else 100.0
+        axes[0, 0].hist(lick_durations, bins=60, range=(0, duration_hi))
+        axes[0, 0].set_title("Lick durations (ms)"); axes[0, 0].set_xlim(0, duration_hi)
+
         axes[0, 1].hist(burst_df["avg_licks_per_burst"], bins=30); axes[0, 1].set_title("Licks per burst")
-        axes[1, 0].hist(burst_df["full_burst_duration_ms"] / 1000, bins=30, alpha=0.6, label="full burst")
-        axes[1, 0].hist(burst_df["lick_burst_duration_ms"] / 1000, bins=30, alpha=0.6, label="lick burst")
-        axes[1, 0].set_title("Burst durations (s)"); axes[1, 0].legend(fontsize=8)
-        if within_burst_ilis:
-            axes[1, 1].hist(np.clip(within_burst_ilis, 0, 1000), bins=60, alpha=0.6, label="within-burst ILI")
-        axes[1, 1].hist(np.clip(burst_df["ili_between_bursts_ms"].dropna(), 0, 60000), bins=60, alpha=0.6, label="between-burst ILI")
-        axes[1, 1].set_title("ILI within vs between bursts (ms)"); axes[1, 1].legend(fontsize=8)
+        axes[1, 0].hist(burst_df["lick_burst_duration_ms"] / 1000, bins=30)
+        axes[1, 0].set_title("Lick burst durations (s)"); axes[1, 0].set_xlabel("s")
+
+        # Within-burst ILIs (~10-1000 ms) and between-burst ILIs (~tens of seconds) differ ~1000x, so
+        # use a log x-axis. There are ~500x fewer between-burst ILIs, so give each its own count y-axis
+        # (within left/blue, between right/orange) instead of squashing both onto one scale. The
+        # burst-split threshold sits in the gap between the two clusters, so mark it.
+        # (We really just want to see that within burst ILIs are small and between burst ILIs are big)
+        within_ax, between_ax = axes[1, 1], axes[1, 1].twinx()
+        log_bins = np.logspace(0, 5, 36)  # 1 ms - 100 s
+        within = np.asarray(within_burst_ilis, dtype="float64")
+        between = np.asarray(between_burst_ilis, dtype="float64")
+        if len(within):
+            within_ax.hist(within, bins=log_bins, histtype="stepfilled", alpha=0.55, color="tab:blue")
+        if len(between):
+            between_ax.hist(between, bins=log_bins, histtype="stepfilled", alpha=0.55, color="tab:orange")
+        threshold_line = within_ax.axvline(threshold_by_side[side_label], color="k", ls="--", lw=1)
+        within_ax.set_xscale("log")
+        # Fancy stuff with formatting bc log x axis bugs me otherwise
+        within_ax.xaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda ms, _: f"{ms:g} ms" if ms < 1000 else f"{ms / 1000:g} s"))
+        within_ax.grid(True, which="major", axis="x", alpha=0.3)
+        within_ax.set_xlabel("inter-lick interval")
+        within_ax.set_ylabel("within-burst count", color="tab:blue")
+        between_ax.set_ylabel("between-burst count", color="tab:orange")
+        within_ax.tick_params(axis="y", labelcolor="tab:blue")
+        between_ax.tick_params(axis="y", labelcolor="tab:orange")
+        within_ax.set_title("ILI within vs between bursts (log)")
+        within_ax.legend([threshold_line], ["burst threshold"], fontsize=8)
         save(fig, f"bursts_{side_name}.png", "burst structure", side_name)
 
         # DLC distances + likelihoods
@@ -971,8 +1058,8 @@ def main():
         return
     print(f"Found {len(pkl_paths)} pickle file(s).")
 
-    # Convert each file independently: optionally skip if the output exists; if one fails, complain
-    # (with traceback) and keep going.
+    # Convert each file independently: optionally skip (--skip-existing) if the output exists
+    # If one fails, complain (with traceback) and keep going
     failed, skipped = [], []
     for pkl_path in pkl_paths:
         if args.skip_existing:

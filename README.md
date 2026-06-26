@@ -44,3 +44,19 @@ Run with the same environment.
   photometry, schema/inspector validation, round-trip check vs the source pickle, devices/coordinates,
   cross-side clock drift. Set `NWB_PATH` at the top.
 - **`explore_pickle.ipynb`** — tour of everything in a source `*_lickprocessed.pkl` (both sides). Set `PKL`.
+
+## Notes
+
+### Sessions with no recorded licks
+
+A session where no licks were recorded (e.g. `IM1928_Trial-RF2-Sucrose`) still has the
+`LickBurst_Vars_...` dict, but it only carries `CumLicks` (all zeros), `Labeled_BurstLick`, and
+`NumLicks` (0). All 13 derived stat keys are absent:
+
+`LickDurations_ms`, `InterlickInterval_ms`, `ILI_startend_ms`, `NumBursts`, `Full_BurstDur`,
+`Lick_BurstDur`, `Avg_LicksPerBurst`, `ILI_betweenBursts`, `ILI_withinBursts`, `BurstThreshold_ms`,
+and the three `Lickrate_*` series (`Lickrate_1s`, `Lickrate_1m`, `Lickrate_5m`).
+
+The converter handles this: the lick/burst tables come out with 0 rows, the lick-rate series are
+omitted, `num_licks`/`num_bursts` are 0 in the metadata, and `burst_threshold_ms` falls back to the
+threshold encoded in the `LickBurst_Vars_...` key suffix (e.g. 2000).
