@@ -923,6 +923,23 @@ def collect_pickles(paths):
     return pkl_paths
 
 
+def expected_session_id(pkl_path):
+    """session_id derived from the pickle *filename*, so --skip-existing can check for an
+    existing output without loading the (large) pickle. Mirrors the session_id built in build_nwb
+    ('{animal}_{trial_label}_{YYYYMMDD}'); returns None if the filename can't be parsed.
+
+    e.g. 'IM1923_Trial-SF5-Sucrose_11-06-2025_lickprocessed.pkl' -> 'IM1923_SF5-Sucrose_20251106'
+    """
+    name = pkl_path.name
+    animal = name.split("_")[0]
+    trial = re.search(r"Trial[-_](.+?)_", name)
+    date = re.search(r"(\d{2})-(\d{2})-(\d{4})", name)   # mm-dd-yyyy in the pickle filename
+    if not (trial and date):
+        return None
+    month, day, year = date.groups()
+    return f"{animal}_{trial.group(1)}_{year}{month}{day}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Berke sham-feeding *_lickprocessed.pkl files to NWB. "
@@ -931,17 +948,27 @@ def main():
         "paths", nargs="*", default=["."],
         help="Directories to search for *_lickprocessed.pkl, and/or individual .pkl files "
              "(default: the current directory).")
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip a pickle if its output NWB already exists (so re-runs don't redo finished files).")
     args = parser.parse_args()
 
     pkl_paths = collect_pickles(args.paths)
     if not pkl_paths:
         print("No *_lickprocessed.pkl files found.")
         return
-    print(f"Found {len(pkl_paths)} pickle file(s) to convert.")
+    print(f"Found {len(pkl_paths)} pickle file(s).")
 
-    # Convert each file independently: if one fails, complain (with traceback) and keep going.
-    failed = []
+    # Convert each file independently: optionally skip if the output exists; if one fails, complain
+    # (with traceback) and keep going.
+    failed, skipped = [], []
     for pkl_path in pkl_paths:
+        if args.skip_existing:
+            session_id = expected_session_id(pkl_path)
+            if session_id and (pkl_path.parent / f"{session_id}.nwb").exists():
+                print(f"Skipping {pkl_path.name}: {session_id}.nwb already exists.")
+                skipped.append(pkl_path)
+                continue
         try:
             convert_one(pkl_path)
         except Exception:
@@ -949,8 +976,9 @@ def main():
             traceback.print_exc()
             failed.append(pkl_path)
 
-    n_ok = len(pkl_paths) - len(failed)
-    print(f"\nConverted {n_ok}/{len(pkl_paths)} file(s).")
+    n_converted = len(pkl_paths) - len(failed) - len(skipped)
+    print(f"\nConverted {n_converted}/{len(pkl_paths)} file(s) "
+          f"({len(skipped)} skipped, {len(failed)} failed).")
     if failed:
         print("Failed:")
         for pkl_path in failed:
